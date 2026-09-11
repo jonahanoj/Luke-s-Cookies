@@ -356,6 +356,9 @@ tabRegister.addEventListener("click", () => setMode("register"));
 authForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   showError(authError, "");
+  authSubmit.disabled = true;
+  const previous = authSubmit.textContent;
+  authSubmit.textContent = mode === "login" ? "Signing in…" : "Creating account…";
   try {
     const path = mode === "login" ? "/api/login" : "/api/register";
     const data = await api(path, {
@@ -369,6 +372,8 @@ authForm.addEventListener("submit", async (event) => {
     showApp();
   } catch (err) {
     showError(authError, err.message);
+    authSubmit.disabled = false;
+    authSubmit.textContent = previous;
   }
 });
 
