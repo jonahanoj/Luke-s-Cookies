@@ -27,15 +27,27 @@ import {
   getWipeInfo,
   closeDb,
   UPLOAD_DIR,
+  setUserAvatar,
+  setUserColor,
+  getAvatarOwner,
+  createGroup,
+  addGroupMember,
+  listMemberProfiles,
 } from "./db.js";
+import { guessMime } from "./mime.js";
+import { processAvatar } from "./image.js";
 
 const PORT = Number(process.env.PORT) || 3000;
-const isProd = Boolean(process.env.RAILWAY_ENVIRONMENT || process.env.NODE_ENV === "production");
+const isProd = Boolean(
+  process.env.RAILWAY_ENVIRONMENT || process.env.NODE_ENV === "production"
+);
 const SESSION_SECRET =
   process.env.SESSION_SECRET ||
   (isProd ? null : "dev-only-secret-change-me");
 const MAX_MESSAGE_BYTES = 1024 * 1024 * 1024;
 const MAX_PIN_BYTES = 500 * 1024 * 1024;
+const MAX_AVATAR_BYTES = 8 * 1024 * 1024;
+const COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 
 if (!SESSION_SECRET) {
   console.error("Set SESSION_SECRET in Railway variables before starting.");
@@ -44,8 +56,24 @@ if (!SESSION_SECRET) {
 
 const USERNAME_RE = /^[a-zA-Z0-9_]{2,24}$/;
 
+function avatarUrl(avatarId) {
+  return avatarId ? `/api/avatars/${avatarId}` : null;
+}
+
 function publicUser(user) {
-  return { username: user.username };
+  return {
+    username: user.username,
+    avatarUrl: avatarUrl(user.avatar_id),
+    nameColor: user.name_color || "#6e8070",
+  };
+}
+
+function publicMember(member) {
+  return {
+    username: member.username,
+    avatarUrl: avatarUrl(member.avatar_id),
+    nameColor: member.name_color || "#6e8070",
+  };
 }
 
 function attachmentSize(message) {
@@ -56,15 +84,22 @@ function attachmentSize(message) {
 }
 
 function publicMessage(message, userId) {
-  const attachments = (message.attachments || []).map((file) => ({
-    id: file.id,
-    name: file.name,
-    mime: file.mime,
-    size: Number(file.size) || 0,
-  }));
+  const attachments = (message.attachments || []).map((file) => {
+    const name = file.name;
+    const mime = guessMime(name, file.mime);
+    return {
+      id: file.id,
+      name,
+      mime,
+      size: Number(file.size) || 0,
+    };
+  });
   return {
     id: message.id,
     mine: message.sender_id === userId,
+    username: message.sender_username || null,
+    nameColor: message.name_color || "#6e8070",
+    avatarUrl: avatarUrl(message.avatar_id),
     body: message.body,
     createdAt: message.created_at,
     pinned: Boolean(message.pinned),
@@ -154,8 +189,12 @@ async function requireUser(req, res, next) {
 }
 
 function emitToConversation(conversation, event, payloadFor) {
-  io.to(conversation.user_low).emit(event, payloadFor(conversation.user_low));
-  io.to(conversation.user_high).emit(event, payloadFor(conversation.user_high));
+  const ids = conversation.member_ids?.length
+    ? conversation.member_ids
+    : [conversation.user_low, conversation.user_high].filter(Boolean);
+  for (const id of ids) {
+    io.to(id).emit(event, payloadFor(id));
+  }
 }
 
 function removeFiles(files) {
@@ -176,6 +215,17 @@ const upload = multer({
   limits: {
     fileSize: MAX_MESSAGE_BYTES,
     files: 12,
+  },
+});
+
+const avatarUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
+    filename: (_req, _file, cb) => cb(null, crypto.randomUUID()),
+  }),
+  limits: {
+    fileSize: MAX_AVATAR_BYTES,
+    files: 1,
   },
 });
 
@@ -216,7 +266,7 @@ app.post("/api/register", async (req, res) => {
     const passwordHash = await bcrypt.hash(password, 10);
     const user = await createUser(username, passwordHash);
     setAuthCookie(res, user.id);
-    res.status(201).json({ user: publicUser(user) });
+    res.status(201).json({ user: publicUser({ ...user, name_color: "#6e8070" }) });
   } catch (err) {
     res.status(err.status || 500).json({ error: err.message || "Could not create account." });
   }
@@ -247,20 +297,59 @@ app.post("/api/username", requireUser, async (req, res) => {
   try {
     const username = parseUsername(req.body.username);
     const user = await updateUsername(req.user.id, username);
-    io.emit("username-changed", {
-      conversationHint: true,
-      username: user.username,
-    });
+    io.emit("username-changed", { username: user.username });
     res.json({ user: publicUser(user) });
   } catch (err) {
     res.status(err.status || 500).json({ error: err.message || "Could not change username." });
   }
 });
 
+app.post("/api/color", requireUser, async (req, res) => {
+  const color = String(req.body.color || "");
+  if (!COLOR_RE.test(color)) {
+    res.status(400).json({ error: "Pick a valid color." });
+    return;
+  }
+  const user = await setUserColor(req.user.id, color.toLowerCase());
+  io.emit("profile-changed", { username: user.username, nameColor: user.name_color });
+  res.json({ user: publicUser(user) });
+});
+
+app.post("/api/avatar", requireUser, avatarUpload.single("avatar"), async (req, res) => {
+  if (!req.file) {
+    res.status(400).json({ error: "Choose an image or gif." });
+    return;
+  }
+  try {
+    const id = req.file.filename;
+    const stored = attachmentPath(id);
+    await processAvatar(req.file.path, stored, req.file.originalname, req.file.mimetype);
+    if (req.user.avatar_id && req.user.avatar_id !== id) {
+      try {
+        fs.unlinkSync(attachmentPath(req.user.avatar_id));
+      } catch {
+        // already gone
+      }
+    }
+    const user = await setUserAvatar(req.user.id, id);
+    io.emit("profile-changed", { username: user.username, avatarUrl: avatarUrl(id) });
+    res.json({ user: publicUser(user) });
+  } catch (err) {
+    removeFiles([req.file]);
+    res.status(err.status || 500).json({ error: err.message || "Could not save picture." });
+  }
+});
+
 app.get("/api/users", requireUser, async (req, res) => {
   const q = String(req.query.q || "");
   const users = await searchUsers(q, req.user.id);
-  res.json({ users: users.map((user) => ({ username: user.username })) });
+  res.json({
+    users: users.map((user) => ({
+      username: user.username,
+      avatarUrl: avatarUrl(user.avatar_id),
+      nameColor: user.name_color || "#6e8070",
+    })),
+  });
 });
 
 app.get("/api/conversations", requireUser, async (req, res) => {
@@ -268,9 +357,15 @@ app.get("/api/conversations", requireUser, async (req, res) => {
   res.json({
     conversations: conversations.map((item) => ({
       id: item.id,
+      isGroup: item.type === "group",
       username: item.other_username,
+      title: item.title,
+      avatarUrl: avatarUrl(item.other_avatar_id),
       lastMessage: item.last_message,
       lastAt: item.last_at,
+      members: (item.members || [])
+        .filter((member) => member.id !== req.user.id)
+        .map(publicMember),
     })),
   });
 });
@@ -288,10 +383,62 @@ app.post("/api/conversations", requireUser, async (req, res) => {
       return;
     }
     const conversation = await getOrCreateConversation(req.user.id, other.id);
-    res.json({ id: conversation.id, username: other.username });
+    res.json({ id: conversation.id, username: other.username, isGroup: false });
   } catch (err) {
     res.status(500).json({ error: err.message || "Could not start chat." });
   }
+});
+
+app.post("/api/groups", requireUser, async (req, res) => {
+  try {
+    const title = String(req.body.title || "").trim().slice(0, 40);
+    const names = Array.isArray(req.body.usernames) ? req.body.usernames : [];
+    if (!title) {
+      res.status(400).json({ error: "Give the group a name." });
+      return;
+    }
+    const memberIds = [req.user.id];
+    for (const raw of names) {
+      const other = await findUserByUsername(String(raw || "").trim());
+      if (!other) {
+        res.status(404).json({ error: `No account named ${raw}.` });
+        return;
+      }
+      if (other.id !== req.user.id) memberIds.push(other.id);
+    }
+    if (memberIds.length < 2) {
+      res.status(400).json({ error: "Add at least one other person." });
+      return;
+    }
+    const group = await createGroup(title, memberIds);
+    const conversation = await userInConversation(group.id, req.user.id);
+    emitToConversation(conversation, "username-changed", () => ({}));
+    res.status(201).json({ id: group.id, username: title, isGroup: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message || "Could not make group." });
+  }
+});
+
+app.post("/api/conversations/:id/members", requireUser, async (req, res) => {
+  const conversation = await userInConversation(req.params.id, req.user.id);
+  if (!conversation || conversation.type !== "group") {
+    res.status(404).json({ error: "Group not found." });
+    return;
+  }
+  const other = await findUserByUsername(String(req.body.username || "").trim());
+  if (!other) {
+    res.status(404).json({ error: "No account with that username." });
+    return;
+  }
+  await addGroupMember(conversation.id, other.id);
+  const members = await listMemberProfiles(conversation.id);
+  io.to(other.id).emit("username-changed", {});
+  emitToConversation(
+    { ...conversation, member_ids: members.map((member) => member.id) },
+    "username-changed",
+    () => ({})
+  );
+  res.json({ members: members.map(publicMember) });
 });
 
 app.get("/api/conversations/:id/messages", requireUser, async (req, res) => {
@@ -334,12 +481,15 @@ app.post(
       res.status(404).json({ error: "Chat not found." });
       return;
     }
-    const attachments = files.map((file) => ({
-      id: file.filename,
-      name: path.basename(file.originalname || "file").slice(0, 180),
-      mime: file.mimetype || "application/octet-stream",
-      size: file.size,
-    }));
+    const attachments = files.map((file) => {
+      const name = path.basename(file.originalname || "file").slice(0, 180);
+      return {
+        id: file.filename,
+        name,
+        mime: guessMime(name, file.mimetype),
+        size: file.size,
+      };
+    });
     const message = await addMessage(
       conversation.id,
       req.user.id,
@@ -420,7 +570,8 @@ app.get("/api/attachments/:id", requireUser, async (req, res) => {
     res.status(404).json({ error: "File not found." });
     return;
   }
-  res.setHeader("Content-Type", file.mime || "application/octet-stream");
+  const mime = guessMime(file.name, file.mime);
+  res.setHeader("Content-Type", mime);
   res.setHeader(
     "Content-Disposition",
     `inline; filename="${encodeURIComponent(file.name || "file")}"`
@@ -428,9 +579,32 @@ app.get("/api/attachments/:id", requireUser, async (req, res) => {
   res.sendFile(stored);
 });
 
+app.get("/api/avatars/:id", requireUser, async (req, res) => {
+  const owner = await getAvatarOwner(req.params.id);
+  if (!owner) {
+    res.status(404).json({ error: "Picture not found." });
+    return;
+  }
+  const stored = attachmentPath(req.params.id);
+  if (!fs.existsSync(stored)) {
+    res.status(404).json({ error: "Picture not found." });
+    return;
+  }
+  const header = Buffer.alloc(12);
+  const handle = fs.openSync(stored, "r");
+  fs.readSync(handle, header, 0, 12, 0);
+  fs.closeSync(handle);
+  let mime = "image/png";
+  if (header[0] === 0x47 && header[1] === 0x49 && header[2] === 0x46) mime = "image/gif";
+  else if (header[0] === 0xff && header[1] === 0xd8) mime = "image/jpeg";
+  else if (header.toString("ascii", 0, 4) === "RIFF") mime = "image/webp";
+  res.setHeader("Content-Type", mime);
+  res.sendFile(stored);
+});
+
 app.use((err, _req, res, _next) => {
   if (err && err.code === "LIMIT_FILE_SIZE") {
-    res.status(400).json({ error: "Uploads can be up to 1 GB per message." });
+    res.status(400).json({ error: "That file is too big." });
     return;
   }
   console.error(err);

@@ -35,7 +35,7 @@
     <div id="app" class="app" hidden>
       <aside class="sidebar">
         <header class="sidebar-top">
-          <img class="small-logo" src="/assets/SmallLogo.png" alt="" />
+          <img id="me-avatar" class="small-logo" src="/assets/SmallLogo.png" alt="" />
           <div class="brand">
             <strong>Luke's Cookies</strong>
             <span id="me-name"></span>
@@ -48,8 +48,9 @@
           <div id="search-results" class="search-results" hidden></div>
         </div>
         <div id="conversation-list" class="conversation-list"></div>
-        <footer class="sidebar-footer">
-          <button id="btn-username" class="btn ghost" type="button">Change username</button>
+        <footer class="sidebar-footer three">
+          <button id="btn-username" class="btn ghost" type="button">Profile</button>
+          <button id="btn-group" class="btn ghost" type="button">New group</button>
           <button id="btn-logout" class="btn ghost" type="button">Log out</button>
         </footer>
       </aside>
@@ -63,6 +64,7 @@
           <header class="thread-top">
             <button id="back-btn" class="back-btn" type="button" aria-label="Back">‹</button>
             <h1 id="thread-name"></h1>
+            <button id="btn-add-member" class="btn ghost" type="button" hidden>Add person</button>
           </header>
           <div id="messages" class="messages"></div>
           <div id="file-preview" class="file-preview" hidden></div>
@@ -81,13 +83,46 @@
 
     <dialog id="username-dialog">
       <form id="username-form" method="dialog">
-        <h2>Change username</h2>
-        <p>Your chats stay put. Only the name people see will change.</p>
-        <input id="new-username" maxlength="24" required />
+        <h2>Profile</h2>
+        <p>Chats stay with you if you change your name.</p>
+        <label class="pfp-picker">
+          <img id="pfp-preview" class="pfp-preview" src="/assets/SmallLogo.png" alt="" />
+          <span>Change picture (gif ok)</span>
+          <input id="pfp-input" type="file" accept="image/*,.gif" />
+        </label>
+        <label>
+          Username
+          <input id="new-username" maxlength="24" required />
+        </label>
+        <p>Name color</p>
+        <div class="hsv">
+          <canvas id="sv-canvas" width="180" height="180"></canvas>
+          <input id="hue-slider" type="range" min="0" max="360" value="140" />
+          <div id="color-preview" class="color-preview">Preview</div>
+        </div>
         <p id="username-error" class="error" hidden></p>
         <div class="dialog-actions">
           <button class="btn ghost" value="cancel" type="submit">Cancel</button>
           <button id="username-save" class="btn primary" type="button">Save</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="group-dialog">
+      <form id="group-form" method="dialog">
+        <h2>New group</h2>
+        <label>
+          Group name
+          <input id="group-title" maxlength="40" required />
+        </label>
+        <label>
+          People (comma separated usernames)
+          <input id="group-people" placeholder="luke, alk" />
+        </label>
+        <p id="group-error" class="error" hidden></p>
+        <div class="dialog-actions">
+          <button class="btn ghost" value="cancel" type="submit">Cancel</button>
+          <button id="group-save" class="btn primary" type="button">Create</button>
         </div>
       </form>
     </dialog>

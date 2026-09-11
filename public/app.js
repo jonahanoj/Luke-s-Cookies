@@ -6,6 +6,7 @@ const authForm = document.getElementById("auth-form");
 const authSubmit = document.getElementById("auth-submit");
 const authError = document.getElementById("auth-error");
 const meName = document.getElementById("me-name");
+const meAvatar = document.getElementById("me-avatar");
 const userSearch = document.getElementById("user-search");
 const searchResults = document.getElementById("search-results");
 const conversationList = document.getElementById("conversation-list");
@@ -23,9 +24,19 @@ const usernameDialog = document.getElementById("username-dialog");
 const usernameForm = document.getElementById("username-form");
 const newUsername = document.getElementById("new-username");
 const usernameError = document.getElementById("username-error");
+const groupDialog = document.getElementById("group-dialog");
+const groupError = document.getElementById("group-error");
+const addMemberBtn = document.getElementById("btn-add-member");
+const pfpPreview = document.getElementById("pfp-preview");
+const svCanvas = document.getElementById("sv-canvas");
+const hueSlider = document.getElementById("hue-slider");
+const colorPreview = document.getElementById("color-preview");
 
 const MAX_MESSAGE_BYTES = 1024 * 1024 * 1024;
 const MAX_PIN_BYTES = 500 * 1024 * 1024;
+const IMAGE_EXT = /\.(png|jpe?g|gif|webp|bmp|avif|svg)$/i;
+const VIDEO_EXT = /\.(mp4|webm|mov)$/i;
+const AUDIO_EXT = /\.(mp3|wav|ogg|m4a)$/i;
 
 let mode = "login";
 let me = null;
@@ -36,7 +47,8 @@ let searchTimer = null;
 let pendingFiles = [];
 let nextWipeAt = null;
 let wipeLabel = "";
-let activeName = "";
+let activeChat = null;
+let hsv = { h: 140, s: 0.35, v: 0.55 };
 
 function applyTheme(theme) {
   const dark = theme === "dark";
@@ -125,8 +137,82 @@ function updateWipeBanner() {
   )} left. Pin one to keep it (max 500 MB).`;
 }
 
-function pendingTotal() {
-  return pendingFiles.reduce((sum, file) => sum + file.size, 0);
+function fileKind(file) {
+  const mime = String(file.mime || "");
+  const name = String(file.name || "");
+  if (mime.startsWith("image/") || IMAGE_EXT.test(name)) return "image";
+  if (mime.startsWith("video/") || VIDEO_EXT.test(name)) return "video";
+  if (mime.startsWith("audio/") || AUDIO_EXT.test(name)) return "audio";
+  return "file";
+}
+
+function hsvToHex(h, s, v) {
+  const c = v * s;
+  const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+  const m = v - c;
+  let r = 0;
+  let g = 0;
+  let b = 0;
+  if (h < 60) [r, g, b] = [c, x, 0];
+  else if (h < 120) [r, g, b] = [x, c, 0];
+  else if (h < 180) [r, g, b] = [0, c, x];
+  else if (h < 240) [r, g, b] = [0, x, c];
+  else if (h < 300) [r, g, b] = [x, 0, c];
+  else [r, g, b] = [c, 0, x];
+  const to = (n) =>
+    Math.round((n + m) * 255)
+      .toString(16)
+      .padStart(2, "0");
+  return `#${to(r)}${to(g)}${to(b)}`;
+}
+
+function hexToHsv(hex) {
+  const n = hex.replace("#", "");
+  const r = parseInt(n.slice(0, 2), 16) / 255;
+  const g = parseInt(n.slice(2, 4), 16) / 255;
+  const b = parseInt(n.slice(4, 6), 16) / 255;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const d = max - min;
+  let h = 0;
+  if (d) {
+    if (max === r) h = 60 * (((g - b) / d) % 6);
+    else if (max === g) h = 60 * ((b - r) / d + 2);
+    else h = 60 * ((r - g) / d + 4);
+  }
+  if (h < 0) h += 360;
+  const s = max ? d / max : 0;
+  return { h, s, v: max };
+}
+
+function currentHex() {
+  return hsvToHex(hsv.h, hsv.s, hsv.v);
+}
+
+function drawSv() {
+  const ctx = svCanvas.getContext("2d");
+  const { width, height } = svCanvas;
+  const hue = hsvToHex(hsv.h, 1, 1);
+  ctx.fillStyle = hue;
+  ctx.fillRect(0, 0, width, height);
+  const white = ctx.createLinearGradient(0, 0, width, 0);
+  white.addColorStop(0, "#fff");
+  white.addColorStop(1, "rgba(255,255,255,0)");
+  ctx.fillStyle = white;
+  ctx.fillRect(0, 0, width, height);
+  const black = ctx.createLinearGradient(0, 0, 0, height);
+  black.addColorStop(0, "rgba(0,0,0,0)");
+  black.addColorStop(1, "#000");
+  ctx.fillStyle = black;
+  ctx.fillRect(0, 0, width, height);
+  colorPreview.style.color = currentHex();
+  colorPreview.textContent = me?.username || "Preview";
+}
+
+function paintMe() {
+  meName.textContent = me.username;
+  meName.style.color = me.nameColor || "";
+  meAvatar.src = me.avatarUrl || "/assets/SmallLogo.png";
 }
 
 function renderPendingFiles() {
@@ -167,6 +253,13 @@ function connectSocket() {
   socket.on("username-changed", async () => {
     await refreshConversations();
   });
+  socket.on("profile-changed", async () => {
+    await refreshConversations();
+    if (activeId) {
+      const current = conversations.find((item) => item.id === activeId);
+      if (current) openConversation(current);
+    }
+  });
   socket.on("wiped", async () => {
     await refreshConversations();
     if (activeId) {
@@ -180,7 +273,7 @@ function showApp() {
   authEl.hidden = true;
   appEl.hidden = false;
   document.getElementById("theme-toggle-auth").hidden = true;
-  meName.textContent = me.username;
+  paintMe();
   connectSocket();
   refreshConversations();
   loadWipe();
@@ -192,6 +285,7 @@ function showAuth() {
   document.getElementById("theme-toggle-auth").hidden = false;
   me = null;
   activeId = null;
+  activeChat = null;
   pendingFiles = [];
   renderPendingFiles();
   if (socket) {
@@ -211,12 +305,27 @@ function formatTime(value) {
   });
 }
 
+function makeAvatar(name, url, color) {
+  const wrap = document.createElement("div");
+  wrap.className = "avatar";
+  wrap.style.background = color || "";
+  if (url) {
+    const img = document.createElement("img");
+    img.src = url;
+    img.alt = "";
+    wrap.append(img);
+  } else {
+    wrap.textContent = (name[0] || "?").toUpperCase();
+  }
+  return wrap;
+}
+
 function renderConversations() {
   conversationList.replaceChildren();
   if (!conversations.length) {
     const empty = document.createElement("p");
     empty.className = "empty-list";
-    empty.textContent = "No chats yet. Search a username to start one.";
+    empty.textContent = "No chats yet. Search a username or make a group.";
     conversationList.append(empty);
     return;
   }
@@ -224,13 +333,20 @@ function renderConversations() {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "conversation" + (item.id === activeId ? " active" : "");
+    const avatar = document.createElement("img");
+    avatar.className = "list-avatar";
+    avatar.src = item.avatarUrl || "/assets/SmallLogo.png";
+    avatar.alt = "";
+    const copy = document.createElement("div");
+    copy.className = "copy";
     const name = document.createElement("span");
     name.className = "name";
-    name.textContent = item.username;
+    name.textContent = item.isGroup ? item.title || item.username : item.username;
     const preview = document.createElement("span");
     preview.className = "preview";
     preview.textContent = item.lastMessage || "No messages yet";
-    button.append(name, preview);
+    copy.append(name, preview);
+    button.append(avatar, copy);
     button.addEventListener("click", () => openConversation(item));
     conversationList.append(button);
   }
@@ -243,8 +359,10 @@ async function refreshConversations() {
   if (activeId) {
     const current = conversations.find((item) => item.id === activeId);
     if (current) {
-      activeName = current.username;
-      threadName.textContent = current.username;
+      activeChat = current;
+      threadName.textContent = current.isGroup
+        ? current.title || current.username
+        : current.username;
     }
   }
 }
@@ -255,19 +373,19 @@ function renderAttachments(message) {
   wrap.className = "attach-list";
   for (const file of message.attachments) {
     const url = `/api/attachments/${file.id}`;
-    const mime = String(file.mime || "");
-    if (mime.startsWith("image/")) {
+    const kind = fileKind(file);
+    if (kind === "image") {
       const img = document.createElement("img");
       img.src = url;
       img.alt = file.name;
       wrap.append(img);
-    } else if (mime.startsWith("video/")) {
+    } else if (kind === "video") {
       const video = document.createElement("video");
       video.src = url;
       video.controls = true;
       video.preload = "metadata";
       wrap.append(video);
-    } else if (mime.startsWith("audio/")) {
+    } else if (kind === "audio") {
       const audio = document.createElement("audio");
       audio.src = url;
       audio.controls = true;
@@ -288,14 +406,15 @@ function upsertMessage(message, replace = false) {
   const existing = messagesEl.querySelector(`[data-id="${message.id}"]`);
   if (existing && !replace) return;
 
-  const whoName = message.mine ? "You" : activeName || "Them";
+  const whoName = message.mine
+    ? "You"
+    : message.username || activeChat?.username || "Them";
   const row = document.createElement("div");
   row.className = "row " + (message.mine ? "mine" : "theirs");
   row.dataset.id = message.id;
 
-  const avatar = document.createElement("div");
-  avatar.className = "avatar";
-  avatar.textContent = (whoName[0] || "?").toUpperCase();
+  const avatarUrl = message.mine ? me?.avatarUrl : message.avatarUrl;
+  const avatar = makeAvatar(whoName, avatarUrl, message.nameColor);
 
   const bubble = document.createElement("div");
   bubble.className =
@@ -308,6 +427,9 @@ function upsertMessage(message, replace = false) {
   const who = document.createElement("div");
   who.className = "who";
   who.textContent = message.pinned ? `${whoName} · Pinned` : whoName;
+  who.style.color = message.mine
+    ? me?.nameColor || message.nameColor
+    : message.nameColor || "";
   const pinBtn = document.createElement("button");
   pinBtn.type = "button";
   pinBtn.className = "pin-btn";
@@ -352,11 +474,12 @@ function upsertMessage(message, replace = false) {
 
 async function openConversation(item) {
   activeId = item.id;
+  activeChat = item;
   appEl.classList.add("show-chat");
   emptyChat.hidden = true;
   thread.hidden = false;
-  activeName = item.username;
-  threadName.textContent = item.username;
+  threadName.textContent = item.isGroup ? item.title || item.username : item.username;
+  addMemberBtn.hidden = !item.isGroup;
   renderConversations();
   const data = await api(`/api/conversations/${item.id}/messages`);
   messagesEl.replaceChildren();
@@ -375,6 +498,7 @@ async function startConversation(username) {
   const item = conversations.find((entry) => entry.id === data.id) || {
     id: data.id,
     username: data.username,
+    isGroup: false,
     lastMessage: null,
   };
   openConversation(item);
@@ -385,6 +509,16 @@ async function loadWipe() {
   nextWipeAt = data.nextWipeAt;
   wipeLabel = data.label || "";
   updateWipeBanner();
+}
+
+function openProfile() {
+  showError(usernameError, "");
+  newUsername.value = me.username;
+  pfpPreview.src = me.avatarUrl || "/assets/SmallLogo.png";
+  hsv = hexToHsv(me.nameColor || "#6e8070");
+  hueSlider.value = String(Math.round(hsv.h));
+  drawSv();
+  usernameDialog.showModal();
 }
 
 tabLogin.addEventListener("click", () => setMode("login"));
@@ -419,21 +553,62 @@ document.getElementById("btn-logout").addEventListener("click", async () => {
   showAuth();
 });
 
-document.getElementById("btn-username").addEventListener("click", () => {
+document.getElementById("btn-username").addEventListener("click", openProfile);
+
+document.getElementById("pfp-input").addEventListener("change", async (event) => {
+  const file = event.target.files?.[0];
+  if (!file) return;
   showError(usernameError, "");
-  newUsername.value = me.username;
-  usernameDialog.showModal();
+  const form = new FormData();
+  form.append("avatar", file);
+  try {
+    const data = await api("/api/avatar", { method: "POST", body: form });
+    me = data.user;
+    paintMe();
+    pfpPreview.src = me.avatarUrl || pfpPreview.src;
+  } catch (err) {
+    showError(usernameError, err.message);
+  }
+  event.target.value = "";
+});
+
+hueSlider.addEventListener("input", () => {
+  hsv.h = Number(hueSlider.value);
+  drawSv();
+});
+
+svCanvas.addEventListener("pointerdown", (event) => {
+  const box = svCanvas.getBoundingClientRect();
+  const pick = (ev) => {
+    const x = Math.min(1, Math.max(0, (ev.clientX - box.left) / box.width));
+    const y = Math.min(1, Math.max(0, (ev.clientY - box.top) / box.height));
+    hsv.s = x;
+    hsv.v = 1 - y;
+    drawSv();
+  };
+  pick(event);
+  const move = (ev) => pick(ev);
+  const up = () => {
+    window.removeEventListener("pointermove", move);
+    window.removeEventListener("pointerup", up);
+  };
+  window.addEventListener("pointermove", move);
+  window.addEventListener("pointerup", up);
 });
 
 document.getElementById("username-save").addEventListener("click", async () => {
   showError(usernameError, "");
   try {
-    const data = await api("/api/username", {
+    const nameData = await api("/api/username", {
       method: "POST",
       body: { username: newUsername.value },
     });
-    me = data.user;
-    meName.textContent = me.username;
+    const colorData = await api("/api/color", {
+      method: "POST",
+      body: { color: currentHex() },
+    });
+    me = { ...nameData.user, ...colorData.user };
+    paintMe();
     usernameDialog.close();
   } catch (err) {
     showError(usernameError, err.message);
@@ -442,6 +617,54 @@ document.getElementById("username-save").addEventListener("click", async () => {
 
 usernameForm.addEventListener("submit", () => {
   usernameDialog.close();
+});
+
+document.getElementById("btn-group").addEventListener("click", () => {
+  showError(groupError, "");
+  document.getElementById("group-title").value = "";
+  document.getElementById("group-people").value = "";
+  groupDialog.showModal();
+});
+
+document.getElementById("group-save").addEventListener("click", async () => {
+  showError(groupError, "");
+  const title = document.getElementById("group-title").value;
+  const usernames = document
+    .getElementById("group-people")
+    .value.split(",")
+    .map((name) => name.trim())
+    .filter(Boolean);
+  try {
+    const data = await api("/api/groups", {
+      method: "POST",
+      body: { title, usernames },
+    });
+    groupDialog.close();
+    await refreshConversations();
+    const item = conversations.find((entry) => entry.id === data.id);
+    if (item) openConversation(item);
+  } catch (err) {
+    showError(groupError, err.message);
+  }
+});
+
+document.getElementById("group-form").addEventListener("submit", () => {
+  groupDialog.close();
+});
+
+addMemberBtn.addEventListener("click", async () => {
+  if (!activeId || !activeChat?.isGroup) return;
+  const username = window.prompt("Username to add");
+  if (!username) return;
+  try {
+    await api(`/api/conversations/${activeId}/members`, {
+      method: "POST",
+      body: { username },
+    });
+    await refreshConversations();
+  } catch (err) {
+    showError(composeError, err.message);
+  }
 });
 
 document.getElementById("back-btn").addEventListener("click", () => {
@@ -472,6 +695,7 @@ userSearch.addEventListener("input", () => {
       button.type = "button";
       button.className = "search-item";
       button.textContent = user.username;
+      button.style.color = user.nameColor || "";
       button.addEventListener("click", () => startConversation(user.username));
       searchResults.append(button);
     }
