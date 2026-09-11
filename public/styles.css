@@ -12,6 +12,30 @@
   --mine: #d7c09a;
   --theirs: #ffffff;
   --line: #d8cbb8;
+  --sidebar: #efe3d1;
+  --you: #4f6153;
+  --them: #8a5a32;
+  color-scheme: light;
+}
+
+html.dark {
+  --cream: #1b1713;
+  --paper: #261f19;
+  --tan: #3a3128;
+  --cookie: #c9a07a;
+  --chip: #e2c4a0;
+  --sage: #8fa392;
+  --sage-dark: #6e8070;
+  --forest: #d7c09a;
+  --ink: #f3eadc;
+  --muted: #b5a894;
+  --mine: #4a3a28;
+  --theirs: #322a23;
+  --line: #3d342b;
+  --sidebar: #221c17;
+  --you: #b8cbb8;
+  --them: #e0b07a;
+  color-scheme: dark;
 }
 
 * {
@@ -95,10 +119,28 @@ input {
   width: 100%;
   margin-top: 6px;
   border: 1px solid var(--line);
-  background: #fff;
+  background: var(--paper);
   padding: 10px 12px;
   color: var(--ink);
   outline: none;
+  font-size: 16px;
+}
+
+.theme-toggle {
+  border: 1px solid var(--line);
+  background: var(--tan);
+  color: var(--ink);
+  cursor: pointer;
+  padding: 6px 10px;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.theme-toggle.corner {
+  position: fixed;
+  top: 12px;
+  right: 12px;
+  z-index: 8;
 }
 
 input:focus {
@@ -141,7 +183,7 @@ input:focus {
 .sidebar {
   display: flex;
   flex-direction: column;
-  background: #efe3d1;
+  background: var(--sidebar);
   border-right: 1px solid var(--line);
   min-height: 0;
 }
@@ -196,7 +238,7 @@ input:focus {
   width: 100%;
   text-align: left;
   background: transparent;
-  padding: 12px;
+  padding: 10px 12px;
   border: 0;
   border-bottom: 1px solid var(--line);
   cursor: pointer;
@@ -274,7 +316,7 @@ input:focus {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 12px 16px;
+  padding: 10px 16px;
   border-bottom: 1px solid var(--line);
   background: var(--paper);
 }
@@ -306,26 +348,63 @@ input:focus {
 .messages {
   flex: 1;
   overflow: auto;
-  padding: 16px;
+  padding: 12px 16px 16px;
   display: flex;
   flex-direction: column;
+  gap: 6px;
+  width: min(720px, 100%);
+  margin: 0 auto;
+}
+
+.row {
+  display: flex;
+  align-items: flex-end;
   gap: 8px;
+  max-width: 85%;
+}
+
+.row.mine {
+  align-self: flex-end;
+  flex-direction: row-reverse;
+}
+
+.row.theirs {
+  align-self: flex-start;
+}
+
+.avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 700;
+  flex-shrink: 0;
+  color: #fff;
+}
+
+.row.mine .avatar {
+  background: var(--you);
+}
+
+.row.theirs .avatar {
+  background: var(--them);
 }
 
 .bubble {
-  max-width: min(70%, 520px);
-  padding: 8px 12px;
+  padding: 6px 10px;
   line-height: 1.35;
   word-wrap: break-word;
+  min-width: 0;
 }
 
 .bubble.mine {
-  align-self: flex-end;
   background: var(--mine);
 }
 
 .bubble.theirs {
-  align-self: flex-start;
   background: var(--theirs);
   border: 1px solid var(--line);
 }
@@ -334,27 +413,41 @@ input:focus {
   outline: 2px solid var(--sage-dark);
 }
 
+.who {
+  font-size: 12px;
+  font-weight: 700;
+  margin-bottom: 2px;
+}
+
+.row.mine .who {
+  color: var(--you);
+  text-align: right;
+}
+
+.row.theirs .who {
+  color: var(--them);
+}
+
 .bubble-top {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  margin-bottom: 4px;
 }
 
 .pin-btn {
   border: 0;
   background: transparent;
-  color: var(--forest);
+  color: var(--muted);
   cursor: pointer;
-  font-size: 12px;
+  font-size: 11px;
   padding: 0;
   white-space: nowrap;
 }
 
 .bubble time {
   display: block;
-  margin-top: 4px;
+  margin-top: 2px;
   font-size: 11px;
   color: var(--muted);
 }
@@ -392,6 +485,8 @@ input:focus {
   gap: 6px;
   padding: 8px 12px 0;
   background: var(--paper);
+  width: min(720px, 100%);
+  margin: 0 auto;
 }
 
 .file-chip {
@@ -419,9 +514,11 @@ input:focus {
 .compose {
   display: flex;
   gap: 8px;
-  padding: 12px;
+  padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
   background: var(--paper);
   border-top: 1px solid var(--line);
+  width: min(720px, 100%);
+  margin: 0 auto;
 }
 
 .attach-btn {
@@ -482,14 +579,6 @@ dialog p {
     grid-template-columns: 1fr;
   }
 
-  .sidebar.hidden-mobile {
-    display: none;
-  }
-
-  .chat.hidden-mobile {
-    display: none;
-  }
-
   .back-btn {
     display: inline-block;
   }
@@ -500,5 +589,24 @@ dialog p {
 
   .app:not(.show-chat) .chat {
     display: none;
+  }
+
+  .messages,
+  .compose,
+  .file-preview,
+  .compose-error {
+    width: 100%;
+  }
+
+  .row {
+    max-width: 92%;
+  }
+
+  .banner {
+    width: min(280px, 80vw);
+  }
+
+  .sidebar-footer .btn {
+    padding: 12px 8px;
   }
 }

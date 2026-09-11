@@ -36,6 +36,27 @@ let searchTimer = null;
 let pendingFiles = [];
 let nextWipeAt = null;
 let wipeLabel = "";
+let activeName = "";
+
+function applyTheme(theme) {
+  const dark = theme === "dark";
+  document.documentElement.classList.toggle("dark", dark);
+  localStorage.setItem("theme", dark ? "dark" : "light");
+  for (const button of document.querySelectorAll(".theme-toggle")) {
+    button.textContent = dark ? "Light" : "Dark";
+  }
+}
+
+function initTheme() {
+  const saved = localStorage.getItem("theme");
+  if (saved) {
+    applyTheme(saved);
+    return;
+  }
+  applyTheme(
+    window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"
+  );
+}
 
 function showError(el, message) {
   if (!el) return;
@@ -158,6 +179,7 @@ function connectSocket() {
 function showApp() {
   authEl.hidden = true;
   appEl.hidden = false;
+  document.getElementById("theme-toggle-auth").hidden = true;
   meName.textContent = me.username;
   connectSocket();
   refreshConversations();
@@ -167,6 +189,7 @@ function showApp() {
 function showAuth() {
   authEl.hidden = false;
   appEl.hidden = true;
+  document.getElementById("theme-toggle-auth").hidden = false;
   me = null;
   activeId = null;
   pendingFiles = [];
@@ -219,7 +242,10 @@ async function refreshConversations() {
   renderConversations();
   if (activeId) {
     const current = conversations.find((item) => item.id === activeId);
-    if (current) threadName.textContent = current.username;
+    if (current) {
+      activeName = current.username;
+      threadName.textContent = current.username;
+    }
   }
 }
 
@@ -261,17 +287,27 @@ function renderAttachments(message) {
 function upsertMessage(message, replace = false) {
   const existing = messagesEl.querySelector(`[data-id="${message.id}"]`);
   if (existing && !replace) return;
+
+  const whoName = message.mine ? "You" : activeName || "Them";
+  const row = document.createElement("div");
+  row.className = "row " + (message.mine ? "mine" : "theirs");
+  row.dataset.id = message.id;
+
+  const avatar = document.createElement("div");
+  avatar.className = "avatar";
+  avatar.textContent = (whoName[0] || "?").toUpperCase();
+
   const bubble = document.createElement("div");
   bubble.className =
     "bubble " +
     (message.mine ? "mine" : "theirs") +
     (message.pinned ? " pinned" : "");
-  bubble.dataset.id = message.id;
 
   const top = document.createElement("div");
   top.className = "bubble-top";
-  const pinLabel = document.createElement("span");
-  pinLabel.textContent = message.pinned ? "Pinned" : "";
+  const who = document.createElement("div");
+  who.className = "who";
+  who.textContent = message.pinned ? `${whoName} · Pinned` : whoName;
   const pinBtn = document.createElement("button");
   pinBtn.type = "button";
   pinBtn.className = "pin-btn";
@@ -294,14 +330,13 @@ function upsertMessage(message, replace = false) {
       showError(composeError, err.message);
     }
   });
-  top.append(pinLabel, pinBtn);
+  top.append(who, pinBtn);
+  bubble.append(top);
 
   if (message.body) {
     const text = document.createElement("div");
     text.textContent = message.body;
-    bubble.append(top, text);
-  } else {
-    bubble.append(top);
+    bubble.append(text);
   }
   const files = renderAttachments(message);
   if (files) bubble.append(files);
@@ -309,8 +344,9 @@ function upsertMessage(message, replace = false) {
   time.textContent = formatTime(message.createdAt);
   bubble.append(time);
 
-  if (existing) existing.replaceWith(bubble);
-  else messagesEl.append(bubble);
+  row.append(avatar, bubble);
+  if (existing) existing.replaceWith(row);
+  else messagesEl.append(row);
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
@@ -319,6 +355,7 @@ async function openConversation(item) {
   appEl.classList.add("show-chat");
   emptyChat.hidden = true;
   thread.hidden = false;
+  activeName = item.username;
   threadName.textContent = item.username;
   renderConversations();
   const data = await api(`/api/conversations/${item.id}/messages`);
@@ -487,6 +524,14 @@ compose.addEventListener("submit", async (event) => {
 });
 
 setInterval(updateWipeBanner, 30000);
+
+for (const button of document.querySelectorAll(".theme-toggle")) {
+  button.addEventListener("click", () => {
+    applyTheme(document.documentElement.classList.contains("dark") ? "light" : "dark");
+  });
+}
+
+initTheme();
 
 (async function boot() {
   try {
