@@ -38,20 +38,39 @@ function zonedLocalToUtc(year, month, day, hour, minute, second, timeZone) {
   return new Date(guess - (thereAsUtc - guess));
 }
 
-export function startOfCurrentMonth(now = new Date()) {
+// Wipes happen every 14 days at local midnight, counted from this Monday.
+const WIPE_PERIOD_DAYS = 14;
+const WIPE_ANCHOR = { year: 2026, month: 1, day: 5 };
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+function dayNumber(year, month, day) {
+  return Math.floor(Date.UTC(year, month - 1, day) / DAY_MS);
+}
+
+function periodBoundary(now, offsetPeriods) {
   const parts = partsInZone(now, WIPE_TIMEZONE);
-  return zonedLocalToUtc(parts.year, parts.month, 1, 0, 0, 0, WIPE_TIMEZONE);
+  const anchor = dayNumber(WIPE_ANCHOR.year, WIPE_ANCHOR.month, WIPE_ANCHOR.day);
+  const today = dayNumber(parts.year, parts.month, parts.day);
+  const index = Math.floor((today - anchor) / WIPE_PERIOD_DAYS) + offsetPeriods;
+  const date = new Date((anchor + index * WIPE_PERIOD_DAYS) * DAY_MS);
+  return zonedLocalToUtc(
+    date.getUTCFullYear(),
+    date.getUTCMonth() + 1,
+    date.getUTCDate(),
+    0,
+    0,
+    0,
+    WIPE_TIMEZONE
+  );
+}
+
+// Messages created before this moment (and not pinned) get wiped.
+export function startOfCurrentPeriod(now = new Date()) {
+  return periodBoundary(now, 0);
 }
 
 export function nextWipeAt(now = new Date()) {
-  const parts = partsInZone(now, WIPE_TIMEZONE);
-  let year = parts.year;
-  let month = parts.month + 1;
-  if (month > 12) {
-    month = 1;
-    year += 1;
-  }
-  return zonedLocalToUtc(year, month, 1, 0, 0, 0, WIPE_TIMEZONE);
+  return periodBoundary(now, 1);
 }
 
 export function wipeLabel(now = new Date()) {

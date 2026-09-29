@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import pg from "pg";
-import { startOfCurrentMonth } from "./calendar.js";
+import { startOfCurrentPeriod } from "./calendar.js";
 
 export { nextWipeAt, getWipeInfo, WIPE_TIMEZONE } from "./calendar.js";
 
@@ -15,14 +15,30 @@ let pool = null;
 let fileStore = null;
 
 function emptyStore() {
-  return { users: [], conversations: [], messages: [] };
+  return {
+    users: [],
+    conversations: [],
+    messages: [],
+    blocks: [],
+    mutes: [],
+    push_subs: [],
+    kv: {},
+  };
 }
 
 function migrateFileStore() {
   for (const user of fileStore.users) {
     if (!user.avatar_id) user.avatar_id = null;
     if (!user.name_color) user.name_color = "#6e8070";
+    if (typeof user.bio !== "string") user.bio = "";
+    if (!user.theme_primary) user.theme_primary = null;
+    if (!user.theme_secondary) user.theme_secondary = null;
+    if (!user.theme_bg_id) user.theme_bg_id = null;
   }
+  if (!Array.isArray(fileStore.blocks)) fileStore.blocks = [];
+  if (!Array.isArray(fileStore.mutes)) fileStore.mutes = [];
+  if (!Array.isArray(fileStore.push_subs)) fileStore.push_subs = [];
+  if (!fileStore.kv || typeof fileStore.kv !== "object") fileStore.kv = {};
   for (const conversation of fileStore.conversations) {
     if (!conversation.type) conversation.type = "dm";
     if (!conversation.title) conversation.title = null;
@@ -160,6 +176,34 @@ export async function initDb() {
       ON CONFLICT DO NOTHING
     `);
     await pool.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT NOT NULL DEFAULT '';
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS theme_primary TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS theme_secondary TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS theme_bg_id TEXT;
+      CREATE TABLE IF NOT EXISTS blocks (
+        blocker_id TEXT NOT NULL,
+        blocked_id TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (blocker_id, blocked_id)
+      );
+      CREATE TABLE IF NOT EXISTS mutes (
+        user_id TEXT NOT NULL,
+        conversation_id TEXT NOT NULL,
+        PRIMARY KEY (user_id, conversation_id)
+      );
+      CREATE TABLE IF NOT EXISTS push_subscriptions (
+        endpoint TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        keys TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS app_kv (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS attachments_message ON attachments (message_id);
+    `);
+    await pool.query(`
       CREATE INDEX IF NOT EXISTS messages_conv_created
         ON messages (conversation_id, created_at)
     `);
@@ -224,6 +268,10 @@ export async function createUser(username, passwordHash) {
       password_hash: passwordHash,
       avatar_id: null,
       name_color: "#6e8070",
+      bio: "",
+      theme_primary: null,
+      theme_secondary: null,
+      theme_bg_id: null,
       created_at: new Date().toISOString(),
     });
     saveFileStore();
@@ -235,46 +283,49 @@ export async function findUserByUsername(username) {
   const usernameLower = username.toLowerCase();
   if (pool) {
     const rows = await pgQuery(
-      `SELECT id, username, password_hash, avatar_id, name_color FROM users WHERE username_lower = $1`,
+      `SELECT ${USER_COLUMNS}, password_hash FROM users WHERE username_lower = $1`,
       [usernameLower]
     );
-    return rows[0] || null;
+    return rows[0] ? { ...shapeUser(rows[0]), password_hash: rows[0].password_hash } : null;
   }
-  return (
-    fileStore.users.find((user) => user.username_lower === usernameLower) || null
-  );
+  const user = fileStore.users.find((item) => item.username_lower === usernameLower);
+  return user ? { ...shapeUser(user), password_hash: user.password_hash } : null;
+}
+
+const USER_COLUMNS =
+  "id, username, avatar_id, name_color, bio, theme_primary, theme_secondary, theme_bg_id";
+
+function shapeUser(user) {
+  if (!user) return null;
+  return {
+    id: user.id,
+    username: user.username,
+    avatar_id: user.avatar_id || null,
+    name_color: user.name_color || "#6e8070",
+    bio: user.bio || "",
+    theme_primary: user.theme_primary || null,
+    theme_secondary: user.theme_secondary || null,
+    theme_bg_id: user.theme_bg_id || null,
+  };
 }
 
 export async function findUserById(id) {
   if (pool) {
-    const rows = await pgQuery(
-      `SELECT id, username, avatar_id, name_color FROM users WHERE id = $1`,
-      [id]
-    );
-    return rows[0] || null;
+    const rows = await pgQuery(`SELECT ${USER_COLUMNS} FROM users WHERE id = $1`, [id]);
+    return shapeUser(rows[0]);
   }
-  const user = fileStore.users.find((item) => item.id === id);
-  return user
-    ? {
-        id: user.id,
-        username: user.username,
-        avatar_id: user.avatar_id || null,
-        name_color: user.name_color || "#6e8070",
-      }
-    : null;
+  return shapeUser(fileStore.users.find((item) => item.id === id));
 }
 
 export async function updateUsername(id, username) {
   const usernameLower = username.toLowerCase();
   if (pool) {
     try {
-      const rows = await pgQuery(
-        `UPDATE users SET username = $1, username_lower = $2
-         WHERE id = $3
-         RETURNING id, username, avatar_id, name_color`,
+      await pgQuery(
+        `UPDATE users SET username = $1, username_lower = $2 WHERE id = $3`,
         [username, usernameLower, id]
       );
-      return rows[0] || null;
+      return findUserById(id);
     } catch (err) {
       if (err.code === "23505") {
         const conflict = new Error("Username taken");
@@ -298,12 +349,7 @@ export async function updateUsername(id, username) {
   user.username = username;
   user.username_lower = usernameLower;
   saveFileStore();
-  return {
-    id: user.id,
-    username: user.username,
-    avatar_id: user.avatar_id || null,
-    name_color: user.name_color || "#6e8070",
-  };
+  return shapeUser(user);
 }
 
 export async function searchUsers(query, excludeId) {
@@ -693,54 +739,143 @@ export function attachmentPath(attachmentId) {
   return path.join(UPLOAD_DIR, attachmentId);
 }
 
-function removeStoredFile(attachmentId) {
+function removeStoredFileCounted(attachmentId) {
+  const file = attachmentPath(attachmentId);
   try {
-    fs.unlinkSync(attachmentPath(attachmentId));
+    const { size } = fs.statSync(file);
+    fs.unlinkSync(file);
+    return size;
   } catch {
-    // already gone
+    return 0;
   }
 }
 
-export async function wipeExpiredMessages() {
-  const cutoff = startOfCurrentMonth().toISOString();
-  let removed = [];
+// Deletes unpinned messages from before the current 14-day period, along with
+// their attachment rows and the files on disk. Conversations, accounts and
+// pinned messages are left alone.
+export async function wipeExpiredMessages(now = new Date()) {
+  const cutoff = startOfCurrentPeriod(now).toISOString();
+  let removedFiles = [];
+  let removedMessages = 0;
   if (pool) {
-    removed = await pgQuery(
-      `SELECT a.id
-       FROM attachments a
-       JOIN messages m ON m.id = a.message_id
-       WHERE m.pinned = FALSE AND m.created_at < $1`,
-      [cutoff]
-    );
-    await pgQuery(
-      `DELETE FROM attachments
-       WHERE message_id IN (
-         SELECT id FROM messages WHERE pinned = FALSE AND created_at < $1
-       )`,
-      [cutoff]
-    );
-    await pgQuery(
-      `DELETE FROM messages WHERE pinned = FALSE AND created_at < $1`,
-      [cutoff]
-    );
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const expired = await client.query(
+        `DELETE FROM messages WHERE pinned = FALSE AND created_at < $1 RETURNING id`,
+        [cutoff]
+      );
+      removedMessages = expired.rowCount;
+      // Also catches attachment rows whose message was already gone.
+      const files = await client.query(
+        `DELETE FROM attachments a
+         WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.id = a.message_id)
+         RETURNING a.id`
+      );
+      removedFiles = files.rows;
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
   } else {
     const keep = [];
     for (const message of fileStore.messages) {
       if (!message.pinned && message.created_at < cutoff) {
+        removedMessages += 1;
         for (const file of message.attachments || []) {
-          removed.push({ id: file.id });
+          removedFiles.push({ id: file.id });
         }
       } else {
         keep.push(message);
       }
     }
-    fileStore.messages = keep;
-    saveFileStore();
+    if (removedMessages) {
+      fileStore.messages = keep;
+      saveFileStore();
+    }
   }
-  for (const file of removed) {
-    removeStoredFile(file.id);
+  let bytes = 0;
+  for (const file of removedFiles) {
+    bytes += removeStoredFileCounted(file.id);
   }
-  return removed.length;
+  return { messages: removedMessages, files: removedFiles.length, bytes, cutoff };
+}
+
+async function referencedFileIds() {
+  const ids = new Set();
+  if (pool) {
+    for (const row of await pgQuery(`SELECT id FROM attachments`)) ids.add(row.id);
+    for (const row of await pgQuery(
+      `SELECT avatar_id, theme_bg_id FROM users
+       WHERE avatar_id IS NOT NULL OR theme_bg_id IS NOT NULL`
+    )) {
+      if (row.avatar_id) ids.add(row.avatar_id);
+      if (row.theme_bg_id) ids.add(row.theme_bg_id);
+    }
+    return ids;
+  }
+  for (const message of fileStore.messages) {
+    for (const file of message.attachments || []) ids.add(file.id);
+  }
+  for (const user of fileStore.users) {
+    if (user.avatar_id) ids.add(user.avatar_id);
+    if (user.theme_bg_id) ids.add(user.theme_bg_id);
+  }
+  return ids;
+}
+
+// Deletes anything in the uploads folder that nothing points to any more
+// (failed uploads, replaced pictures, leftovers). Files younger than
+// minAgeMs are skipped so uploads still in progress are never touched.
+export async function sweepOrphanFiles(minAgeMs = 60 * 60 * 1000) {
+  const referenced = await referencedFileIds();
+  let files = 0;
+  let bytes = 0;
+  let names = [];
+  try {
+    names = fs.readdirSync(UPLOAD_DIR);
+  } catch {
+    return { files, bytes };
+  }
+  const now = Date.now();
+  for (const name of names) {
+    if (referenced.has(name)) continue;
+    const full = path.join(UPLOAD_DIR, name);
+    try {
+      const stat = fs.statSync(full);
+      if (!stat.isFile() || now - stat.mtimeMs < minAgeMs) continue;
+      fs.unlinkSync(full);
+      files += 1;
+      bytes += stat.size;
+    } catch {
+      // gone or busy; try again next sweep
+    }
+  }
+  return { files, bytes };
+}
+
+export function uploadDirUsage() {
+  let files = 0;
+  let bytes = 0;
+  try {
+    for (const name of fs.readdirSync(UPLOAD_DIR)) {
+      try {
+        const stat = fs.statSync(path.join(UPLOAD_DIR, name));
+        if (stat.isFile()) {
+          files += 1;
+          bytes += stat.size;
+        }
+      } catch {
+        // skip
+      }
+    }
+  } catch {
+    // no folder yet
+  }
+  return { files, bytes };
 }
 
 export async function listMemberProfiles(conversationId) {
@@ -775,44 +910,26 @@ export async function listMemberProfiles(conversationId) {
 
 export async function setUserAvatar(userId, avatarId) {
   if (pool) {
-    const rows = await pgQuery(
-      `UPDATE users SET avatar_id = $1 WHERE id = $2
-       RETURNING id, username, avatar_id, name_color`,
-      [avatarId, userId]
-    );
-    return rows[0] || null;
+    await pgQuery(`UPDATE users SET avatar_id = $1 WHERE id = $2`, [avatarId, userId]);
+    return findUserById(userId);
   }
   const user = fileStore.users.find((item) => item.id === userId);
   if (!user) return null;
   user.avatar_id = avatarId;
   saveFileStore();
-  return {
-    id: user.id,
-    username: user.username,
-    avatar_id: user.avatar_id,
-    name_color: user.name_color || "#6e8070",
-  };
+  return shapeUser(user);
 }
 
 export async function setUserColor(userId, color) {
   if (pool) {
-    const rows = await pgQuery(
-      `UPDATE users SET name_color = $1 WHERE id = $2
-       RETURNING id, username, avatar_id, name_color`,
-      [color, userId]
-    );
-    return rows[0] || null;
+    await pgQuery(`UPDATE users SET name_color = $1 WHERE id = $2`, [color, userId]);
+    return findUserById(userId);
   }
   const user = fileStore.users.find((item) => item.id === userId);
   if (!user) return null;
   user.name_color = color;
   saveFileStore();
-  return {
-    id: user.id,
-    username: user.username,
-    avatar_id: user.avatar_id || null,
-    name_color: user.name_color,
-  };
+  return shapeUser(user);
 }
 
 export async function getAvatarOwner(avatarId) {
@@ -877,3 +994,218 @@ export async function addGroupMember(conversationId, userId) {
   saveFileStore();
 }
 
+
+export async function setBio(userId, bio) {
+  if (pool) {
+    await pgQuery(`UPDATE users SET bio = $1 WHERE id = $2`, [bio, userId]);
+    return findUserById(userId);
+  }
+  const user = fileStore.users.find((item) => item.id === userId);
+  if (!user) return null;
+  user.bio = bio;
+  saveFileStore();
+  return shapeUser(user);
+}
+
+export async function setThemeColors(userId, primary, secondary) {
+  if (pool) {
+    await pgQuery(
+      `UPDATE users SET theme_primary = $1, theme_secondary = $2 WHERE id = $3`,
+      [primary, secondary, userId]
+    );
+    return findUserById(userId);
+  }
+  const user = fileStore.users.find((item) => item.id === userId);
+  if (!user) return null;
+  user.theme_primary = primary;
+  user.theme_secondary = secondary;
+  saveFileStore();
+  return shapeUser(user);
+}
+
+export async function setThemeBackground(userId, backgroundId) {
+  if (pool) {
+    await pgQuery(`UPDATE users SET theme_bg_id = $1 WHERE id = $2`, [
+      backgroundId,
+      userId,
+    ]);
+    return findUserById(userId);
+  }
+  const user = fileStore.users.find((item) => item.id === userId);
+  if (!user) return null;
+  user.theme_bg_id = backgroundId;
+  saveFileStore();
+  return shapeUser(user);
+}
+
+// ---- blocking ----
+
+export async function setBlocked(blockerId, blockedId, blocked) {
+  if (pool) {
+    if (blocked) {
+      await pgQuery(
+        `INSERT INTO blocks (blocker_id, blocked_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+        [blockerId, blockedId]
+      );
+    } else {
+      await pgQuery(`DELETE FROM blocks WHERE blocker_id = $1 AND blocked_id = $2`, [
+        blockerId,
+        blockedId,
+      ]);
+    }
+    return;
+  }
+  fileStore.blocks = fileStore.blocks.filter(
+    (row) => !(row.blocker_id === blockerId && row.blocked_id === blockedId)
+  );
+  if (blocked) fileStore.blocks.push({ blocker_id: blockerId, blocked_id: blockedId });
+  saveFileStore();
+}
+
+// Ids this user has blocked.
+export async function blockedIdsBy(userId) {
+  if (pool) {
+    const rows = await pgQuery(`SELECT blocked_id FROM blocks WHERE blocker_id = $1`, [
+      userId,
+    ]);
+    return new Set(rows.map((row) => row.blocked_id));
+  }
+  return new Set(
+    fileStore.blocks.filter((row) => row.blocker_id === userId).map((row) => row.blocked_id)
+  );
+}
+
+// Ids of people who have blocked this user.
+export async function blockerIdsOf(userId) {
+  if (pool) {
+    const rows = await pgQuery(`SELECT blocker_id FROM blocks WHERE blocked_id = $1`, [
+      userId,
+    ]);
+    return new Set(rows.map((row) => row.blocker_id));
+  }
+  return new Set(
+    fileStore.blocks.filter((row) => row.blocked_id === userId).map((row) => row.blocker_id)
+  );
+}
+
+export async function listBlockedUsers(userId) {
+  const ids = [...(await blockedIdsBy(userId))];
+  const users = [];
+  for (const id of ids) {
+    const user = await findUserById(id);
+    if (user) users.push(user);
+  }
+  return users.sort((a, b) => a.username.localeCompare(b.username));
+}
+
+// ---- muting (per conversation) ----
+
+export async function setMuted(userId, conversationId, muted) {
+  if (pool) {
+    if (muted) {
+      await pgQuery(
+        `INSERT INTO mutes (user_id, conversation_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+        [userId, conversationId]
+      );
+    } else {
+      await pgQuery(`DELETE FROM mutes WHERE user_id = $1 AND conversation_id = $2`, [
+        userId,
+        conversationId,
+      ]);
+    }
+    return;
+  }
+  fileStore.mutes = fileStore.mutes.filter(
+    (row) => !(row.user_id === userId && row.conversation_id === conversationId)
+  );
+  if (muted) fileStore.mutes.push({ user_id: userId, conversation_id: conversationId });
+  saveFileStore();
+}
+
+export async function mutedConversationIds(userId) {
+  if (pool) {
+    const rows = await pgQuery(`SELECT conversation_id FROM mutes WHERE user_id = $1`, [
+      userId,
+    ]);
+    return new Set(rows.map((row) => row.conversation_id));
+  }
+  return new Set(
+    fileStore.mutes.filter((row) => row.user_id === userId).map((row) => row.conversation_id)
+  );
+}
+
+// ---- pinned messages across every chat the user is in ----
+
+export async function listPinnedForUser(userId) {
+  const conversations = await listConversations(userId);
+  const result = [];
+  for (const conversation of conversations) {
+    const messages = await listMessages(conversation.id);
+    for (const message of messages) {
+      if (message.pinned) result.push({ conversation, message });
+    }
+  }
+  const time = (value) => new Date(value).getTime();
+  result.sort((a, b) => time(b.message.created_at) - time(a.message.created_at));
+  return result;
+}
+
+// ---- web push subscriptions ----
+
+export async function savePushSubscription(userId, subscription) {
+  const endpoint = subscription.endpoint;
+  const keys = JSON.stringify(subscription.keys || {});
+  if (pool) {
+    await pgQuery(
+      `INSERT INTO push_subscriptions (endpoint, user_id, keys) VALUES ($1, $2, $3)
+       ON CONFLICT (endpoint) DO UPDATE SET user_id = EXCLUDED.user_id, keys = EXCLUDED.keys`,
+      [endpoint, userId, keys]
+    );
+    return;
+  }
+  fileStore.push_subs = fileStore.push_subs.filter((row) => row.endpoint !== endpoint);
+  fileStore.push_subs.push({ endpoint, user_id: userId, keys });
+  saveFileStore();
+}
+
+export async function removePushSubscription(endpoint) {
+  if (pool) {
+    await pgQuery(`DELETE FROM push_subscriptions WHERE endpoint = $1`, [endpoint]);
+    return;
+  }
+  const before = fileStore.push_subs.length;
+  fileStore.push_subs = fileStore.push_subs.filter((row) => row.endpoint !== endpoint);
+  if (fileStore.push_subs.length !== before) saveFileStore();
+}
+
+export async function pushSubscriptionsFor(userId) {
+  const rows = pool
+    ? await pgQuery(`SELECT endpoint, keys FROM push_subscriptions WHERE user_id = $1`, [
+        userId,
+      ])
+    : fileStore.push_subs.filter((row) => row.user_id === userId);
+  return rows.map((row) => ({ endpoint: row.endpoint, keys: JSON.parse(row.keys) }));
+}
+
+// ---- small key/value store (VAPID keys etc.) ----
+
+export async function kvGet(key) {
+  if (pool) {
+    const rows = await pgQuery(`SELECT value FROM app_kv WHERE key = $1`, [key]);
+    return rows[0]?.value ?? null;
+  }
+  return fileStore.kv[key] ?? null;
+}
+
+export async function kvSet(key, value) {
+  if (pool) {
+    await pgQuery(
+      `INSERT INTO app_kv (key, value) VALUES ($1, $2)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+      [key, value]
+    );
+    return;
+  }
+  fileStore.kv[key] = value;
+  saveFileStore();
+}

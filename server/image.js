@@ -28,3 +28,39 @@ export async function processAvatar(inputPath, outputPath, originalName, mime) {
   }
   return type;
 }
+
+// Theme backgrounds: keep them reasonably small so they don't eat disk space.
+export async function processBackground(inputPath, outputPath, originalName, mime) {
+  const type = guessMime(originalName, mime);
+  if (!type.startsWith("image/")) {
+    const err = new Error("Theme background must be an image.");
+    err.status = 400;
+    throw err;
+  }
+  const tmp = `${outputPath}.tmp`;
+  try {
+    await sharp(inputPath, { animated: false })
+      .rotate()
+      .resize(2560, 2560, { fit: "inside", withoutEnlargement: true })
+      .webp({ quality: 82 })
+      .toFile(tmp);
+  } catch {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      // nothing written
+    }
+    const err = new Error("Could not read that image.");
+    err.status = 400;
+    throw err;
+  }
+  fs.renameSync(tmp, outputPath);
+  if (inputPath !== outputPath) {
+    try {
+      fs.unlinkSync(inputPath);
+    } catch {
+      // already gone
+    }
+  }
+  return "image/webp";
+}

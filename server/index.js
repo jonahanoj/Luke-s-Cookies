@@ -33,9 +33,24 @@ import {
   createGroup,
   addGroupMember,
   listMemberProfiles,
+  sweepOrphanFiles,
+  uploadDirUsage,
+  setBio,
+  setThemeColors,
+  setThemeBackground,
+  setBlocked,
+  blockedIdsBy,
+  blockerIdsOf,
+  listBlockedUsers,
+  setMuted,
+  mutedConversationIds,
+  listPinnedForUser,
+  savePushSubscription,
+  removePushSubscription,
 } from "./db.js";
 import { guessMime } from "./mime.js";
-import { processAvatar } from "./image.js";
+import { processAvatar, processBackground } from "./image.js";
+import { initPush, pushPublicKey, sendPush } from "./push.js";
 
 const PORT = Number(process.env.PORT) || 3000;
 const isProd = Boolean(
@@ -47,6 +62,8 @@ const SESSION_SECRET =
 const MAX_MESSAGE_BYTES = 1024 * 1024 * 1024;
 const MAX_PIN_BYTES = 500 * 1024 * 1024;
 const MAX_AVATAR_BYTES = 8 * 1024 * 1024;
+const MAX_BACKGROUND_BYTES = 20 * 1024 * 1024;
+const MAX_BIO_CHARS = 300;
 const COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 
 if (!SESSION_SECRET) {
@@ -60,12 +77,25 @@ function avatarUrl(avatarId) {
   return avatarId ? `/api/avatars/${avatarId}` : null;
 }
 
+// The signed-in user's own view of themselves (includes their theme).
 function publicUser(user) {
   return {
     username: user.username,
     avatarUrl: avatarUrl(user.avatar_id),
     nameColor: user.name_color || "#6e8070",
+    bio: user.bio || "",
+    theme: {
+      primary: user.theme_primary || null,
+      secondary: user.theme_secondary || null,
+      backgroundUrl: user.theme_bg_id ? `/api/backgrounds/${user.theme_bg_id}` : null,
+    },
   };
+}
+
+function formatBytes(bytes) {
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
 function publicMember(member) {
@@ -83,7 +113,23 @@ function attachmentSize(message) {
   );
 }
 
-function publicMessage(message, userId) {
+function publicMessage(message, userId, blocked = null) {
+  const mine = message.sender_id === userId;
+  if (!mine && blocked?.has(message.sender_id)) {
+    return {
+      id: message.id,
+      mine: false,
+      blocked: true,
+      username: message.sender_username || null,
+      nameColor: message.name_color || "#6e8070",
+      avatarUrl: null,
+      body: "",
+      createdAt: message.created_at,
+      pinned: Boolean(message.pinned),
+      attachments: [],
+      totalSize: 0,
+    };
+  }
   const attachments = (message.attachments || []).map((file) => {
     const name = file.name;
     const mime = guessMime(name, file.mime);
@@ -96,7 +142,7 @@ function publicMessage(message, userId) {
   });
   return {
     id: message.id,
-    mine: message.sender_id === userId,
+    mine,
     username: message.sender_username || null,
     nameColor: message.name_color || "#6e8070",
     avatarUrl: avatarUrl(message.avatar_id),
@@ -197,6 +243,51 @@ function emitToConversation(conversation, event, payloadFor) {
   }
 }
 
+function attachmentSummary(attachments) {
+  if (!attachments.length) return "";
+  const kinds = attachments.map((file) => {
+    const mime = guessMime(file.name, file.mime);
+    if (mime === "image/gif") return "a GIF";
+    if (mime.startsWith("image/")) return "a photo";
+    if (mime.startsWith("video/")) return "a video";
+    if (mime.startsWith("audio/")) return "an audio clip";
+    return "a file";
+  });
+  if (attachments.length === 1) return `Sent ${kinds[0]}`;
+  return `Sent ${attachments.length} attachments`;
+}
+
+// Is this user looking at the app right now? If so they already see the
+// message and don't need a push notification.
+async function userIsWatching(userId, conversationId) {
+  const sockets = await io.in(userId).fetchSockets();
+  return sockets.some(
+    (socket) => socket.data.visible && socket.data.conversationId === conversationId
+  );
+}
+
+async function notifyMembers(conversation, message, blockers) {
+  const sender = await findUserById(message.sender_id);
+  const senderName = sender?.username || "Someone";
+  const text = message.body
+    ? message.body.length > 140
+      ? `${message.body.slice(0, 139)}…`
+      : message.body
+    : attachmentSummary(message.attachments || []);
+  const isGroup = conversation.type === "group";
+  for (const userId of conversation.member_ids || []) {
+    if (userId === message.sender_id || blockers.has(userId)) continue;
+    if ((await mutedConversationIds(userId)).has(conversation.id)) continue;
+    if (await userIsWatching(userId, conversation.id)) continue;
+    await sendPush(userId, {
+      title: isGroup ? `${conversation.title || "Group"}` : senderName,
+      body: isGroup ? `${senderName}: ${text}` : text,
+      conversationId: conversation.id,
+      tag: conversation.id,
+    });
+  }
+}
+
 function removeFiles(files) {
   for (const file of files || []) {
     try {
@@ -225,6 +316,17 @@ const avatarUpload = multer({
   }),
   limits: {
     fileSize: MAX_AVATAR_BYTES,
+    files: 1,
+  },
+});
+
+const backgroundUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
+    filename: (_req, _file, cb) => cb(null, crypto.randomUUID()),
+  }),
+  limits: {
+    fileSize: MAX_BACKGROUND_BYTES,
     files: 1,
   },
 });
@@ -293,6 +395,177 @@ app.post("/api/logout", (_req, res) => {
   res.json({ ok: true });
 });
 
+app.post("/api/bio", requireUser, async (req, res) => {
+  const bio = String(req.body.bio ?? "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  if (bio.length > MAX_BIO_CHARS) {
+    res.status(400).json({ error: `About me can be up to ${MAX_BIO_CHARS} characters.` });
+    return;
+  }
+  const user = await setBio(req.user.id, bio);
+  res.json({ user: publicUser(user) });
+});
+
+app.post("/api/theme", requireUser, async (req, res) => {
+  const primary = String(req.body.primary || "").toLowerCase();
+  const secondary = String(req.body.secondary || "").toLowerCase();
+  if (!COLOR_RE.test(primary) || !COLOR_RE.test(secondary)) {
+    res.status(400).json({ error: "Pick valid theme colors." });
+    return;
+  }
+  const user = await setThemeColors(req.user.id, primary, secondary);
+  res.json({ user: publicUser(user) });
+});
+
+function deleteUpload(id) {
+  if (!id) return;
+  try {
+    fs.unlinkSync(attachmentPath(id));
+  } catch {
+    // already gone
+  }
+}
+
+app.post(
+  "/api/theme/background",
+  requireUser,
+  (req, res, next) => backgroundUpload.single("background")(req, res, next),
+  async (req, res) => {
+    if (!req.file) {
+      res.status(400).json({ error: "Choose an image." });
+      return;
+    }
+    try {
+      const id = req.file.filename;
+      await processBackground(
+        req.file.path,
+        attachmentPath(id),
+        req.file.originalname,
+        req.file.mimetype
+      );
+      const previous = req.user.theme_bg_id;
+      const user = await setThemeBackground(req.user.id, id);
+      if (previous && previous !== id) deleteUpload(previous);
+      res.json({ user: publicUser(user) });
+    } catch (err) {
+      removeFiles([req.file]);
+      res.status(err.status || 500).json({ error: err.message || "Could not save background." });
+    }
+  }
+);
+
+app.delete("/api/theme/background", requireUser, async (req, res) => {
+  const previous = req.user.theme_bg_id;
+  const user = await setThemeBackground(req.user.id, null);
+  deleteUpload(previous);
+  res.json({ user: publicUser(user) });
+});
+
+app.get("/api/backgrounds/:id", requireUser, async (req, res) => {
+  if (req.user.theme_bg_id !== req.params.id) {
+    res.status(404).json({ error: "Not found." });
+    return;
+  }
+  const stored = attachmentPath(req.params.id);
+  if (!fs.existsSync(stored)) {
+    res.status(404).json({ error: "Not found." });
+    return;
+  }
+  res.setHeader("Content-Type", "image/webp");
+  res.setHeader("Cache-Control", "private, max-age=31536000, immutable");
+  res.sendFile(stored);
+});
+
+app.get("/api/users/:username/profile", requireUser, async (req, res) => {
+  const user = await findUserByUsername(String(req.params.username || ""));
+  if (!user) {
+    res.status(404).json({ error: "No account with that username." });
+    return;
+  }
+  const blocked = await blockedIdsBy(req.user.id);
+  res.json({
+    profile: {
+      username: user.username,
+      avatarUrl: avatarUrl(user.avatar_id),
+      nameColor: user.name_color || "#6e8070",
+      bio: user.bio || "",
+      isMe: user.id === req.user.id,
+      blocked: blocked.has(user.id),
+    },
+  });
+});
+
+app.post("/api/users/:username/block", requireUser, async (req, res) => {
+  const user = await findUserByUsername(String(req.params.username || ""));
+  if (!user || user.id === req.user.id) {
+    res.status(404).json({ error: "No account with that username." });
+    return;
+  }
+  const blocked = Boolean(req.body.blocked);
+  await setBlocked(req.user.id, user.id, blocked);
+  res.json({ blocked });
+});
+
+app.get("/api/blocked", requireUser, async (req, res) => {
+  const users = await listBlockedUsers(req.user.id);
+  res.json({ users: users.map(publicMember) });
+});
+
+app.post("/api/conversations/:id/mute", requireUser, async (req, res) => {
+  const conversation = await userInConversation(req.params.id, req.user.id);
+  if (!conversation) {
+    res.status(404).json({ error: "Chat not found." });
+    return;
+  }
+  const muted = Boolean(req.body.muted);
+  await setMuted(req.user.id, conversation.id, muted);
+  res.json({ muted });
+});
+
+app.get("/api/pinned", requireUser, async (req, res) => {
+  const blocked = await blockedIdsBy(req.user.id);
+  const rows = await listPinnedForUser(req.user.id);
+  res.json({
+    pinned: rows.map(({ conversation, message }) => ({
+      conversationId: conversation.id,
+      chatName: conversation.title,
+      isGroup: conversation.type === "group",
+      ...publicMessage(message, req.user.id, blocked),
+    })),
+  });
+});
+
+app.get("/api/push/key", requireUser, (_req, res) => {
+  res.json({ publicKey: pushPublicKey() });
+});
+
+app.post("/api/push/subscribe", requireUser, async (req, res) => {
+  const sub = req.body.subscription;
+  if (
+    !sub ||
+    typeof sub.endpoint !== "string" ||
+    !/^https:\/\//.test(sub.endpoint) ||
+    !sub.keys?.p256dh ||
+    !sub.keys?.auth
+  ) {
+    res.status(400).json({ error: "Bad subscription." });
+    return;
+  }
+  await savePushSubscription(req.user.id, {
+    endpoint: sub.endpoint,
+    keys: { p256dh: String(sub.keys.p256dh), auth: String(sub.keys.auth) },
+  });
+  res.json({ ok: true });
+});
+
+app.post("/api/push/unsubscribe", requireUser, async (req, res) => {
+  const endpoint = String(req.body.endpoint || "");
+  if (endpoint) await removePushSubscription(endpoint);
+  res.json({ ok: true });
+});
+
 app.post("/api/username", requireUser, async (req, res) => {
   try {
     const username = parseUsername(req.body.username);
@@ -354,10 +627,18 @@ app.get("/api/users", requireUser, async (req, res) => {
 
 app.get("/api/conversations", requireUser, async (req, res) => {
   const conversations = await listConversations(req.user.id);
+  const muted = await mutedConversationIds(req.user.id);
+  const blocked = await blockedIdsBy(req.user.id);
   res.json({
     conversations: conversations.map((item) => ({
       id: item.id,
       isGroup: item.type === "group",
+      muted: muted.has(item.id),
+      blocked:
+        item.type !== "group" &&
+        (item.members || []).some(
+          (member) => member.id !== req.user.id && blocked.has(member.id)
+        ),
       username: item.other_username,
       title: item.title,
       avatarUrl: avatarUrl(item.other_avatar_id),
@@ -448,8 +729,9 @@ app.get("/api/conversations/:id/messages", requireUser, async (req, res) => {
     return;
   }
   const messages = await listMessages(conversation.id);
+  const blocked = await blockedIdsBy(req.user.id);
   res.json({
-    messages: messages.map((message) => publicMessage(message, req.user.id)),
+    messages: messages.map((message) => publicMessage(message, req.user.id, blocked)),
   });
 });
 
@@ -481,6 +763,20 @@ app.post(
       res.status(404).json({ error: "Chat not found." });
       return;
     }
+    if (conversation.type !== "group") {
+      const otherId = conversation.member_ids.find((id) => id !== req.user.id);
+      const iBlocked = (await blockedIdsBy(req.user.id)).has(otherId);
+      const theyBlocked = (await blockerIdsOf(req.user.id)).has(otherId);
+      if (iBlocked || theyBlocked) {
+        removeFiles(files);
+        res.status(403).json({
+          error: iBlocked
+            ? "You blocked this person. Unblock them to send messages."
+            : "You can't message this person.",
+        });
+        return;
+      }
+    }
     const attachments = files.map((file) => {
       const name = path.basename(file.originalname || "file").slice(0, 180);
       return {
@@ -496,11 +792,15 @@ app.post(
       body,
       attachments
     );
+    const blockers = await blockerIdsOf(req.user.id);
     emitToConversation(conversation, "message", (userId) => ({
       conversationId: conversation.id,
-      ...publicMessage(message, userId),
+      ...publicMessage(message, userId, blockers.has(userId) ? new Set([req.user.id]) : null),
     }));
     res.status(201).json(publicMessage(message, req.user.id));
+    notifyMembers(conversation, message, blockers).catch((err) =>
+      console.warn("Notify failed:", err.message)
+    );
   }
 );
 
@@ -525,9 +825,10 @@ app.post("/api/messages/:id/pin", requireUser, async (req, res) => {
     return;
   }
   const updated = await setPinned(message.id, true);
+  const blockers = await blockerIdsOf(updated.sender_id);
   emitToConversation(conversation, "message-updated", (userId) => ({
     conversationId: conversation.id,
-    ...publicMessage(updated, userId),
+    ...publicMessage(updated, userId, blockers.has(userId) ? new Set([updated.sender_id]) : null),
   }));
   res.json(publicMessage(updated, req.user.id));
 });
@@ -547,9 +848,10 @@ app.post("/api/messages/:id/unpin", requireUser, async (req, res) => {
     return;
   }
   const updated = await setPinned(message.id, false);
+  const blockers = await blockerIdsOf(updated.sender_id);
   emitToConversation(conversation, "message-updated", (userId) => ({
     conversationId: conversation.id,
-    ...publicMessage(updated, userId),
+    ...publicMessage(updated, userId, blockers.has(userId) ? new Set([updated.sender_id]) : null),
   }));
   res.json(publicMessage(updated, req.user.id));
 });
@@ -602,7 +904,9 @@ app.get("/api/avatars/:id", requireUser, async (req, res) => {
   res.sendFile(stored);
 });
 
-app.use((err, _req, res, _next) => {
+app.use((err, req, res, _next) => {
+  removeFiles(req.files);
+  if (req.file) removeFiles([req.file]);
   if (err && err.code === "LIMIT_FILE_SIZE") {
     res.status(400).json({ error: "That file is too big." });
     return;
@@ -626,18 +930,38 @@ io.use((socket, next) => {
 
 io.on("connection", (socket) => {
   socket.join(socket.userId);
+  socket.data.visible = false;
+  socket.data.conversationId = null;
+  socket.on("presence", (state) => {
+    socket.data.visible = Boolean(state?.visible);
+    socket.data.conversationId =
+      typeof state?.conversationId === "string" ? state.conversationId : null;
+  });
 });
 
 async function runWipe() {
-  const removed = await wipeExpiredMessages();
-  if (removed > 0) {
-    io.emit("wiped");
+  try {
+    const wiped = await wipeExpiredMessages();
+    const swept = await sweepOrphanFiles();
+    if (wiped.messages || wiped.files || swept.files) {
+      const usage = uploadDirUsage();
+      console.log(
+        `Wipe: removed ${wiped.messages} messages, ${wiped.files} attachments ` +
+          `(${formatBytes(wiped.bytes)}), ${swept.files} leftover files ` +
+          `(${formatBytes(swept.bytes)}). Uploads now ${usage.files} files, ` +
+          `${formatBytes(usage.bytes)}.`
+      );
+    }
+    if (wiped.messages) io.emit("wiped");
+  } catch (err) {
+    console.error("Wipe failed:", err);
   }
 }
 
 await initDb();
+await initPush();
 await runWipe();
-setInterval(runWipe, 60 * 60 * 1000);
+setInterval(runWipe, 15 * 60 * 1000);
 
 server.requestTimeout = 30 * 60 * 1000;
 server.headersTimeout = 31 * 60 * 1000;
@@ -646,7 +970,9 @@ server.timeout = 30 * 60 * 1000;
 server.listen(PORT, "0.0.0.0", () => {
   const wipe = getWipeInfo();
   console.log(`Luke's Cookies listening on ${PORT}`);
-  console.log(`Next calendar wipe: ${wipe.label} (${wipe.timezone})`);
+  const usage = uploadDirUsage();
+  console.log(`Next wipe: ${wipe.label} (${wipe.timezone}), every 14 days`);
+  console.log(`Uploads on disk: ${usage.files} files, ${formatBytes(usage.bytes)}`);
 });
 
 async function shutdown() {
