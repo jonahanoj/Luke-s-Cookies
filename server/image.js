@@ -64,3 +64,48 @@ export async function processBackground(inputPath, outputPath, originalName, mim
   }
   return "image/webp";
 }
+
+// Custom emojis: small, keeps transparency, keeps GIF/WebP animation.
+export async function processEmoji(inputPath, outputPath, originalName, mime) {
+  const type = guessMime(originalName, mime);
+  if (!type.startsWith("image/")) {
+    const err = new Error("Emojis must be images or GIFs.");
+    err.status = 400;
+    throw err;
+  }
+  const animated = type === "image/gif" || type === "image/webp";
+  const tmp = `${outputPath}.tmp`;
+  let outMime = "image/png";
+  try {
+    let pipeline = sharp(inputPath, { animated }).resize(128, 128, {
+      fit: "inside",
+      withoutEnlargement: true,
+    });
+    const meta = await sharp(inputPath, { animated }).metadata();
+    if ((meta.pages || 1) > 1) {
+      pipeline = type === "image/gif" ? pipeline.gif() : pipeline.webp({ quality: 85 });
+      outMime = type === "image/gif" ? "image/gif" : "image/webp";
+    } else {
+      pipeline = pipeline.png();
+    }
+    await pipeline.toFile(tmp);
+  } catch {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      // nothing written
+    }
+    const err = new Error(`Could not read ${originalName}.`);
+    err.status = 400;
+    throw err;
+  }
+  fs.renameSync(tmp, outputPath);
+  if (inputPath !== outputPath) {
+    try {
+      fs.unlinkSync(inputPath);
+    } catch {
+      // already gone
+    }
+  }
+  return outMime;
+}

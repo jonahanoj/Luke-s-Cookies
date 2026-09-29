@@ -326,7 +326,12 @@ function connectSocket() {
     if (payload.pinned || sideTab === "pinned") refreshPinned();
     if (payload.conversationId !== activeId) return;
     upsertMessage(payload);
+    if (payload.fx?.effect && !payload.mine && document.visibilityState === "visible") {
+      Fx.autoplay([payload]);
+    }
   });
+  socket.on("conversation-updated", (payload) => Groups.onConversationUpdated(payload.conversationId));
+  socket.on("tasks-changed", (payload) => Groups.onTasksChanged(payload.conversationId));
   socket.on("message-updated", (payload) => {
     refreshPinned();
     if (payload.conversationId !== activeId) return;
@@ -361,6 +366,7 @@ function showApp() {
   });
   loadWipe();
   syncSubscription();
+  Fx.Emoji.load();
 }
 
 function showAuth() {
@@ -508,8 +514,10 @@ function paintThreadHeader() {
     : "Stop notifications from this chat";
   const blocked = Boolean(activeChat.blocked);
   blockedNote.hidden = !blocked;
-  compose.hidden = blocked;
+  compose.hidden = blocked || !$("tasks-panel").hidden;
   if (blocked) blockedText.textContent = `You blocked ${activeChat.username}.`;
+  $("filter-tasks").hidden = !activeChat.isGroup;
+  $("thread-title").title = activeChat.isGroup ? "Group settings" : "View profile";
 }
 
 function makeAvatar(name, url, color, username) {
@@ -635,6 +643,19 @@ function upsertMessage(message, replace = false) {
   if (profileName) who.addEventListener("click", () => openProfile(profileName));
   top.append(who);
 
+  if (message.fx?.effect && !message.blocked) {
+    const replay = document.createElement("button");
+    replay.type = "button";
+    replay.className = "pin-btn fx-replay";
+    replay.textContent = "▶ Effect";
+    replay.title = "Play this message's screen effect";
+    replay.addEventListener("click", (event) => {
+      event.stopPropagation();
+      Fx.playMessage(message);
+    });
+    top.append(replay);
+  }
+
   if (!message.blocked) {
     const pinBtn = document.createElement("button");
     pinBtn.type = "button";
@@ -664,12 +685,18 @@ function upsertMessage(message, replace = false) {
     const text = document.createElement("div");
     text.textContent = "Message from someone you blocked";
     bubble.append(text);
+  } else if (message.fx?.spans) {
+    const text = document.createElement("div");
+    text.className = "body-text";
+    Fx.renderSpans(text, message.fx.spans, filterQuery);
+    bubble.append(text);
   } else if (message.body) {
     const text = document.createElement("div");
     text.className = "body-text";
     renderRichText(text, message.body, filterQuery);
     bubble.append(text);
   }
+  if (message.fx?.pack && !message.blocked) bubble.append(Fx.renderPackCard(message.fx.pack));
   const files = renderAttachments(message);
   if (files) bubble.append(files);
   const time = document.createElement("time");
@@ -700,6 +727,7 @@ async function loadMessages(conversationId) {
   for (const message of data.messages) upsertMessage(message);
   applyFilter();
   messagesEl.scrollTop = messagesEl.scrollHeight;
+  Fx.autoplay(data.messages);
 }
 
 async function openConversation(item) {
@@ -711,6 +739,7 @@ async function openConversation(item) {
   thread.hidden = false;
   showError(composeError, "");
   if (switching) {
+    Fx.stop();
     filterMode = "all";
     filterQuery = "";
     chatSearch.value = "";
@@ -718,6 +747,7 @@ async function openConversation(item) {
     filterPinned.classList.remove("active");
   }
   paintThreadHeader();
+  Groups.onThreadOpened(item, switching);
   renderConversations();
   sendPresence();
   await loadMessages(item.id);
@@ -781,7 +811,8 @@ function applyFilter() {
     if (!message) continue;
     applyFilterToRow(row, message);
     const body = row.querySelector(".body-text");
-    if (body && message.body) renderRichText(body, message.body, filterQuery);
+    if (body && message.fx?.spans) Fx.renderSpans(body, message.fx.spans, filterQuery);
+    else if (body && message.body) renderRichText(body, message.body, filterQuery);
   }
   updateFilterStatus();
   if (!isFiltering()) messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -1307,6 +1338,10 @@ $("group-form").addEventListener("submit", () => groupDialog.close());
 
 addMemberBtn.addEventListener("click", async () => {
   if (!activeId || !activeChat?.isGroup) return;
+  if (typeof Groups !== "undefined") {
+    Groups.openInfo();
+    return;
+  }
   const username = window.prompt("Username to add");
   if (!username) return;
   try {
@@ -1406,6 +1441,8 @@ compose.addEventListener("submit", async (event) => {
   showError(composeError, "");
   const form = new FormData();
   form.append("body", body);
+  const emojiFx = Fx.textToFx(body);
+  if (emojiFx) form.append("fx", JSON.stringify(emojiFx));
   for (const file of pendingFiles) form.append("files", file);
   composeInput.value = "";
   const sentFiles = pendingFiles;
@@ -1430,6 +1467,30 @@ compose.addEventListener("submit", async (event) => {
   }
 });
 
+$("emoji-btn").addEventListener("click", (event) => {
+  const picker = $("emoji-picker");
+  if (!picker.hidden) {
+    Fx.closePicker();
+    return;
+  }
+  Fx.openPicker(event.currentTarget, (emoji) => {
+    const token = `:${emoji.name}:`;
+    const start = composeInput.selectionStart ?? composeInput.value.length;
+    const end = composeInput.selectionEnd ?? start;
+    const before = composeInput.value.slice(0, start);
+    const pad = before && !before.endsWith(" ") ? " " : "";
+    composeInput.value = `${before}${pad}${token} ${composeInput.value.slice(end)}`;
+    const caret = before.length + pad.length + token.length + 1;
+    composeInput.setSelectionRange(caret, caret);
+  });
+});
+
+$("fx-btn").addEventListener("click", () => Fx.openEditor(composeInput.value.trim()));
+$("settings-emojis").addEventListener("click", () => {
+  cancelSettings();
+  Fx.openManager();
+});
+
 setInterval(updateWipeBanner, 30000);
 document.addEventListener("visibilitychange", sendPresence);
 window.addEventListener("focus", sendPresence);
@@ -1444,6 +1505,19 @@ if ("serviceWorker" in navigator) {
     else pendingOpen = event.data.conversationId;
   });
 }
+
+// If a profile picture's file is missing on the server, show the default
+// logo instead of a broken image.
+document.addEventListener(
+  "error",
+  (event) => {
+    const img = event.target;
+    if (!(img instanceof HTMLImageElement)) return;
+    if (!img.src.includes("/api/avatars/")) return;
+    img.src = "/assets/SmallLogo.png";
+  },
+  true
+);
 
 registerServiceWorker();
 

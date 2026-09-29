@@ -47,9 +47,31 @@ import {
   listPinnedForUser,
   savePushSubscription,
   removePushSubscription,
+  renameGroup,
+  setGroupAvatar,
+  setGroupCreator,
+  removeGroupMember,
+  deleteConversation,
+  listTasks,
+  getTask,
+  createTask,
+  updateTask,
+  deleteTask,
+  listEmojiPacks,
+  getEmojiPack,
+  createEmojiPack,
+  renameEmojiPack,
+  deleteEmojiPack,
+  addEmoji,
+  getEmoji,
+  emojiFileKnown,
+  renameEmoji,
+  deleteEmoji,
+  copyEmojiPack,
 } from "./db.js";
+import { sanitizeFx, spansToText, fxAssetIds } from "./fx.js";
 import { guessMime } from "./mime.js";
-import { processAvatar, processBackground } from "./image.js";
+import { processAvatar, processBackground, processEmoji } from "./image.js";
 import { initPush, pushPublicKey, sendPush } from "./push.js";
 
 const PORT = Number(process.env.PORT) || 3000;
@@ -130,7 +152,7 @@ function publicMessage(message, userId, blocked = null) {
       totalSize: 0,
     };
   }
-  const attachments = (message.attachments || []).map((file) => {
+  const all = (message.attachments || []).map((file) => {
     const name = file.name;
     const mime = guessMime(name, file.mime);
     return {
@@ -138,8 +160,15 @@ function publicMessage(message, userId, blocked = null) {
       name,
       mime,
       size: Number(file.size) || 0,
+      role: file.role === "fx" ? "fx" : "file",
     };
   });
+  const attachments = all
+    .filter((file) => file.role === "file")
+    .map(({ role, ...file }) => file);
+  const fxMime = Object.fromEntries(
+    all.filter((file) => file.role === "fx").map((file) => [file.id, file.mime])
+  );
   return {
     id: message.id,
     mine,
@@ -150,7 +179,9 @@ function publicMessage(message, userId, blocked = null) {
     createdAt: message.created_at,
     pinned: Boolean(message.pinned),
     attachments,
-    totalSize: attachments.reduce((sum, file) => sum + file.size, 0),
+    fx: message.fx || null,
+    fxMime,
+    totalSize: all.reduce((sum, file) => sum + file.size, 0),
   };
 }
 
@@ -273,7 +304,10 @@ async function notifyMembers(conversation, message, blockers) {
     ? message.body.length > 140
       ? `${message.body.slice(0, 139)}…`
       : message.body
-    : attachmentSummary(message.attachments || []);
+    : message.fx?.pack
+      ? "Shared an emoji pack"
+      : attachmentSummary((message.attachments || []).filter((file) => file.role !== "fx")) ||
+        (message.fx?.effect ? "Sent an effect" : "");
   const isGroup = conversation.type === "group";
   for (const userId of conversation.member_ids || []) {
     if (userId === message.sender_id || blockers.has(userId)) continue;
@@ -305,7 +339,7 @@ const upload = multer({
   }),
   limits: {
     fileSize: MAX_MESSAGE_BYTES,
-    files: 12,
+    files: 25,
   },
 });
 
@@ -613,6 +647,178 @@ app.post("/api/avatar", requireUser, avatarUpload.single("avatar"), async (req, 
   }
 });
 
+// ---- custom emojis ----
+
+const EMOJI_NAME_RE = /^[A-Za-z0-9_]{1,32}$/;
+
+function emojiName(value, fallback = "emoji") {
+  const cleaned = String(value || "")
+    .replace(/\.[^.]+$/, "")
+    .replace(/[^A-Za-z0-9_]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 32);
+  return EMOJI_NAME_RE.test(cleaned) ? cleaned : fallback;
+}
+
+function publicPack(pack) {
+  return {
+    id: pack.id,
+    name: pack.name,
+    emojis: (pack.emojis || []).map((emoji) => ({
+      id: emoji.id,
+      name: emoji.name,
+      fileId: emoji.file_id,
+      url: `/api/emoji-files/${emoji.file_id}`,
+    })),
+  };
+}
+
+async function ownPack(req, res) {
+  const pack = await getEmojiPack(req.params.id);
+  if (!pack || pack.owner_id !== req.user.id) {
+    res.status(404).json({ error: "Emoji pack not found." });
+    return null;
+  }
+  return pack;
+}
+
+const emojiUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
+    filename: (_req, _file, cb) => cb(null, crypto.randomUUID()),
+  }),
+  limits: { fileSize: 8 * 1024 * 1024, files: 50 },
+});
+
+app.get("/api/emojis", requireUser, async (req, res) => {
+  const packs = await listEmojiPacks(req.user.id);
+  res.json({ packs: packs.map(publicPack) });
+});
+
+app.post("/api/emoji-packs", requireUser, async (req, res) => {
+  const name = String(req.body.name || "").trim().slice(0, 40) || "My emojis";
+  const pack = await createEmojiPack(req.user.id, name);
+  res.status(201).json({ pack: publicPack(pack) });
+});
+
+// Anyone signed in can look at a pack (for shared-pack cards).
+app.get("/api/emoji-packs/:id", requireUser, async (req, res) => {
+  const pack = await getEmojiPack(req.params.id);
+  if (!pack) {
+    res.status(404).json({ error: "That emoji pack no longer exists." });
+    return;
+  }
+  res.json({ pack: publicPack(pack), mine: pack.owner_id === req.user.id });
+});
+
+app.patch("/api/emoji-packs/:id", requireUser, async (req, res) => {
+  const pack = await ownPack(req, res);
+  if (!pack) return;
+  const name = String(req.body.name || "").trim().slice(0, 40);
+  if (!name) {
+    res.status(400).json({ error: "Give the pack a name." });
+    return;
+  }
+  await renameEmojiPack(pack.id, name);
+  res.json({ ok: true });
+});
+
+app.delete("/api/emoji-packs/:id", requireUser, async (req, res) => {
+  const pack = await ownPack(req, res);
+  if (!pack) return;
+  await deleteEmojiPack(pack.id);
+  res.json({ ok: true });
+});
+
+app.post("/api/emoji-packs/:id/copy", requireUser, async (req, res) => {
+  const pack = await copyEmojiPack(req.params.id, req.user.id);
+  if (!pack) {
+    res.status(404).json({ error: "That emoji pack no longer exists." });
+    return;
+  }
+  res.status(201).json({ pack: publicPack(pack) });
+});
+
+app.post(
+  "/api/emoji-packs/:id/emojis",
+  requireUser,
+  emojiUpload.array("emojis", 50),
+  async (req, res) => {
+    const files = req.files || [];
+    const pack = await ownPack(req, res);
+    if (!pack) {
+      removeFiles(files);
+      return;
+    }
+    if (!files.length) {
+      res.status(400).json({ error: "Choose some images or GIFs." });
+      return;
+    }
+    const taken = new Set(pack.emojis.map((emoji) => emoji.name.toLowerCase()));
+    const errors = [];
+    for (const file of files) {
+      try {
+        const mime = await processEmoji(
+          file.path,
+          attachmentPath(file.filename),
+          file.originalname,
+          file.mimetype
+        );
+        let name = emojiName(file.originalname);
+        let n = 2;
+        while (taken.has(name.toLowerCase())) name = `${emojiName(file.originalname).slice(0, 28)}_${n++}`;
+        taken.add(name.toLowerCase());
+        await addEmoji(pack.id, name, file.filename, mime);
+      } catch (err) {
+        removeFiles([file]);
+        errors.push(err.message);
+      }
+    }
+    const updated = await getEmojiPack(pack.id);
+    res.json({ pack: publicPack(updated), errors });
+  }
+);
+
+async function ownEmoji(req, res) {
+  const emoji = await getEmoji(req.params.id);
+  if (!emoji || emoji.owner_id !== req.user.id) {
+    res.status(404).json({ error: "Emoji not found." });
+    return null;
+  }
+  return emoji;
+}
+
+app.patch("/api/emojis/:id", requireUser, async (req, res) => {
+  const emoji = await ownEmoji(req, res);
+  if (!emoji) return;
+  const name = String(req.body.name || "").trim();
+  if (!EMOJI_NAME_RE.test(name)) {
+    res.status(400).json({ error: "Emoji names can use letters, numbers and _ (max 32)." });
+    return;
+  }
+  await renameEmoji(emoji.id, name);
+  res.json({ ok: true });
+});
+
+app.delete("/api/emojis/:id", requireUser, async (req, res) => {
+  const emoji = await ownEmoji(req, res);
+  if (!emoji) return;
+  await deleteEmoji(emoji.id);
+  res.json({ ok: true });
+});
+
+app.get("/api/emoji-files/:id", requireUser, async (req, res) => {
+  const known = await emojiFileKnown(req.params.id);
+  const stored = attachmentPath(req.params.id);
+  if (!known || !fs.existsSync(stored)) {
+    res.status(404).json({ error: "Emoji not found." });
+    return;
+  }
+  res.setHeader("Content-Type", known.mime || "image/png");
+  res.setHeader("Cache-Control", "private, max-age=31536000, immutable");
+  res.sendFile(stored);
+});
+
 app.get("/api/users", requireUser, async (req, res) => {
   const q = String(req.query.q || "");
   const users = await searchUsers(q, req.user.id);
@@ -642,6 +848,11 @@ app.get("/api/conversations", requireUser, async (req, res) => {
       username: item.other_username,
       title: item.title,
       avatarUrl: avatarUrl(item.other_avatar_id),
+      isCreator: item.type === "group" && item.created_by === req.user.id,
+      createdBy:
+        (item.members || []).find((member) => member.id === item.created_by)?.username || null,
+      canRemove:
+        item.type === "group" && (!item.created_by || item.created_by === req.user.id),
       lastMessage: item.last_message,
       lastAt: item.last_at,
       members: (item.members || [])
@@ -691,7 +902,7 @@ app.post("/api/groups", requireUser, async (req, res) => {
       res.status(400).json({ error: "Add at least one other person." });
       return;
     }
-    const group = await createGroup(title, memberIds);
+    const group = await createGroup(title, memberIds, req.user.id);
     const conversation = await userInConversation(group.id, req.user.id);
     emitToConversation(conversation, "username-changed", () => ({}));
     res.status(201).json({ id: group.id, username: title, isGroup: true });
@@ -722,6 +933,198 @@ app.post("/api/conversations/:id/members", requireUser, async (req, res) => {
   res.json({ members: members.map(publicMember) });
 });
 
+// ---- group management ----
+
+async function requireGroup(req, res) {
+  const conversation = await userInConversation(req.params.id, req.user.id);
+  if (!conversation || conversation.type !== "group") {
+    res.status(404).json({ error: "Group not found." });
+    return null;
+  }
+  return conversation;
+}
+
+function emitGroupChanged(conversation, extraIds = []) {
+  const ids = new Set([...(conversation.member_ids || []), ...extraIds]);
+  for (const id of ids) io.to(id).emit("conversation-updated", { conversationId: conversation.id });
+}
+
+app.get("/api/conversations/:id/members", requireUser, async (req, res) => {
+  const conversation = await requireGroup(req, res);
+  if (!conversation) return;
+  const members = await listMemberProfiles(conversation.id);
+  res.json({
+    createdBy: conversation.created_by || null,
+    members: members.map((member) => ({
+      ...publicMember(member),
+      isCreator: member.id === conversation.created_by,
+      isMe: member.id === req.user.id,
+    })),
+  });
+});
+
+app.patch("/api/conversations/:id", requireUser, async (req, res) => {
+  const conversation = await requireGroup(req, res);
+  if (!conversation) return;
+  const title = String(req.body.title || "").trim().slice(0, 40);
+  if (!title) {
+    res.status(400).json({ error: "Give the group a name." });
+    return;
+  }
+  await renameGroup(conversation.id, title);
+  emitGroupChanged(conversation);
+  res.json({ ok: true, title });
+});
+
+app.post(
+  "/api/conversations/:id/avatar",
+  requireUser,
+  avatarUpload.single("avatar"),
+  async (req, res) => {
+    const conversation = await requireGroup(req, res);
+    if (!conversation) {
+      if (req.file) removeFiles([req.file]);
+      return;
+    }
+    if (!req.file) {
+      res.status(400).json({ error: "Choose an image or gif." });
+      return;
+    }
+    try {
+      const id = req.file.filename;
+      await processAvatar(req.file.path, attachmentPath(id), req.file.originalname, req.file.mimetype);
+      const previous = conversation.avatar_id;
+      await setGroupAvatar(conversation.id, id);
+      if (previous && previous !== id) deleteUpload(previous);
+      emitGroupChanged(conversation);
+      res.json({ avatarUrl: avatarUrl(id) });
+    } catch (err) {
+      removeFiles([req.file]);
+      res.status(err.status || 500).json({ error: err.message || "Could not save picture." });
+    }
+  }
+);
+
+app.delete("/api/conversations/:id/members/:username", requireUser, async (req, res) => {
+  const conversation = await requireGroup(req, res);
+  if (!conversation) return;
+  if (conversation.created_by && conversation.created_by !== req.user.id) {
+    res.status(403).json({ error: "Only the person who made the group can remove people." });
+    return;
+  }
+  const other = await findUserByUsername(String(req.params.username || ""));
+  if (!other || !conversation.member_ids.includes(other.id)) {
+    res.status(404).json({ error: "That person isn't in this group." });
+    return;
+  }
+  if (other.id === req.user.id) {
+    res.status(400).json({ error: "Use Leave group to leave." });
+    return;
+  }
+  await removeGroupMember(conversation.id, other.id);
+  emitGroupChanged(conversation, [other.id]);
+  res.json({ ok: true });
+});
+
+app.post("/api/conversations/:id/leave", requireUser, async (req, res) => {
+  const conversation = await requireGroup(req, res);
+  if (!conversation) return;
+  await removeGroupMember(conversation.id, req.user.id);
+  const remaining = conversation.member_ids.filter((id) => id !== req.user.id);
+  if (!remaining.length) {
+    await deleteConversation(conversation.id);
+  } else if (conversation.created_by === req.user.id) {
+    // Hand the group to whoever is left so someone can still manage it.
+    await setGroupCreator(conversation.id, remaining[0]);
+  }
+  emitGroupChanged(conversation);
+  res.json({ ok: true });
+});
+
+// ---- tasks ----
+
+function publicTask(task, usernames) {
+  return {
+    id: task.id,
+    title: task.title,
+    kind: task.kind,
+    done: task.done,
+    percent: task.percent,
+    createdBy: usernames.get(task.created_by) || null,
+    createdAt: task.created_at,
+  };
+}
+
+async function memberNames(conversationId) {
+  const members = await listMemberProfiles(conversationId);
+  return new Map(members.map((member) => [member.id, member.username]));
+}
+
+async function emitTasks(conversation) {
+  emitToConversation(conversation, "tasks-changed", () => ({ conversationId: conversation.id }));
+}
+
+app.get("/api/conversations/:id/tasks", requireUser, async (req, res) => {
+  const conversation = await requireGroup(req, res);
+  if (!conversation) return;
+  const names = await memberNames(conversation.id);
+  const tasks = await listTasks(conversation.id);
+  res.json({ tasks: tasks.map((task) => publicTask(task, names)) });
+});
+
+app.post("/api/conversations/:id/tasks", requireUser, async (req, res) => {
+  const conversation = await requireGroup(req, res);
+  if (!conversation) return;
+  const title = String(req.body.title || "").trim().slice(0, 200);
+  const kind = req.body.kind === "percent" ? "percent" : "check";
+  if (!title) {
+    res.status(400).json({ error: "Give the task a name." });
+    return;
+  }
+  const task = await createTask(conversation.id, title, kind, req.user.id);
+  await emitTasks(conversation);
+  res.status(201).json({ task: publicTask(task, await memberNames(conversation.id)) });
+});
+
+async function taskForUser(req, res) {
+  const task = await getTask(req.params.id);
+  const conversation = task ? await userInConversation(task.conversation_id, req.user.id) : null;
+  if (!task || !conversation) {
+    res.status(404).json({ error: "Task not found." });
+    return {};
+  }
+  return { task, conversation };
+}
+
+app.patch("/api/tasks/:id", requireUser, async (req, res) => {
+  const { task, conversation } = await taskForUser(req, res);
+  if (!task) return;
+  const changes = {};
+  if (typeof req.body.title === "string" && req.body.title.trim()) {
+    changes.title = req.body.title.trim().slice(0, 200);
+  }
+  if (req.body.percent !== undefined && task.kind === "percent") {
+    const percent = Math.round(Math.min(100, Math.max(0, Number(req.body.percent) || 0)));
+    changes.percent = percent;
+    changes.done = percent >= 100;
+  }
+  if (typeof req.body.done === "boolean") {
+    changes.done = req.body.done;
+    if (task.kind === "percent") changes.percent = req.body.done ? 100 : Math.min(task.percent, 99);
+  }
+  const updated = await updateTask(task.id, changes);
+  await emitTasks(conversation);
+  res.json({ task: publicTask(updated, await memberNames(conversation.id)) });
+});
+
+app.delete("/api/tasks/:id", requireUser, async (req, res) => {
+  const { task, conversation } = await taskForUser(req, res);
+  if (!task) return;
+  await deleteTask(task.id);
+  await emitTasks(conversation);
+  res.json({ ok: true });
+});
+
 app.get("/api/conversations/:id/messages", requireUser, async (req, res) => {
   const conversation = await userInConversation(req.params.id, req.user.id);
   if (!conversation) {
@@ -738,28 +1141,46 @@ app.get("/api/conversations/:id/messages", requireUser, async (req, res) => {
 app.post(
   "/api/conversations/:id/messages",
   requireUser,
-  upload.array("files", 12),
+  upload.fields([
+    { name: "files", maxCount: 12 },
+    { name: "fxfiles", maxCount: 13 },
+  ]),
   async (req, res) => {
-    const files = req.files || [];
-    const body = String(req.body.body || "").trim();
-    if (body.length > 2000) {
-      removeFiles(files);
-      res.status(400).json({ error: "Message is too long." });
-      return;
+    const plainFiles = req.files?.files || [];
+    const fxFiles = req.files?.fxfiles || [];
+    const files = [...plainFiles, ...fxFiles];
+    let fx = null;
+    if (req.body.fx) {
+      try {
+        fx = sanitizeFx(
+          JSON.parse(String(req.body.fx)),
+          fxFiles.map((file) => file.filename)
+        );
+      } catch {
+        fx = null;
+      }
     }
-    if (!body && files.length === 0) {
+    // Drop fx uploads the effect doesn't actually use.
+    const usedFx = fxAssetIds(fx);
+    const keptFx = fxFiles.filter((file) => usedFx.has(file.filename));
+    removeFiles(fxFiles.filter((file) => !usedFx.has(file.filename)));
+    let body = String(req.body.body || "").trim();
+    if (fx?.spans) body = spansToText(fx.spans).trim();
+    if (body.length > 2000) body = body.slice(0, 2000);
+    if (!body && plainFiles.length === 0 && !fx) {
+      removeFiles(files);
       res.status(400).json({ error: "Message cannot be empty." });
       return;
     }
-    const total = files.reduce((sum, file) => sum + file.size, 0);
+    const total = [...plainFiles, ...keptFx].reduce((sum, file) => sum + file.size, 0);
     if (total > MAX_MESSAGE_BYTES) {
-      removeFiles(files);
+      removeFiles([...plainFiles, ...keptFx]);
       res.status(400).json({ error: "Uploads can be up to 1 GB per message." });
       return;
     }
     const conversation = await userInConversation(req.params.id, req.user.id);
     if (!conversation) {
-      removeFiles(files);
+      removeFiles([...plainFiles, ...keptFx]);
       res.status(404).json({ error: "Chat not found." });
       return;
     }
@@ -768,7 +1189,7 @@ app.post(
       const iBlocked = (await blockedIdsBy(req.user.id)).has(otherId);
       const theyBlocked = (await blockerIdsOf(req.user.id)).has(otherId);
       if (iBlocked || theyBlocked) {
-        removeFiles(files);
+        removeFiles([...plainFiles, ...keptFx]);
         res.status(403).json({
           error: iBlocked
             ? "You blocked this person. Unblock them to send messages."
@@ -777,20 +1198,26 @@ app.post(
         return;
       }
     }
-    const attachments = files.map((file) => {
+    const toAttachment = (role) => (file) => {
       const name = path.basename(file.originalname || "file").slice(0, 180);
       return {
         id: file.filename,
         name,
         mime: guessMime(name, file.mimetype),
         size: file.size,
+        role,
       };
-    });
+    };
+    const attachments = [
+      ...plainFiles.map(toAttachment("file")),
+      ...keptFx.map(toAttachment("fx")),
+    ];
     const message = await addMessage(
       conversation.id,
       req.user.id,
       body,
-      attachments
+      attachments,
+      fx
     );
     const blockers = await blockerIdsOf(req.user.id);
     emitToConversation(conversation, "message", (userId) => ({
@@ -905,7 +1332,8 @@ app.get("/api/avatars/:id", requireUser, async (req, res) => {
 });
 
 app.use((err, req, res, _next) => {
-  removeFiles(req.files);
+  if (Array.isArray(req.files)) removeFiles(req.files);
+  else if (req.files) removeFiles(Object.values(req.files).flat());
   if (req.file) removeFiles([req.file]);
   if (err && err.code === "LIMIT_FILE_SIZE") {
     res.status(400).json({ error: "That file is too big." });

@@ -86,18 +86,31 @@
             </button>
             <div class="thread-actions">
               <button id="btn-mute" class="btn ghost small" type="button">Mute</button>
-              <button id="btn-add-member" class="btn ghost small" type="button" hidden>Add person</button>
+              <button id="btn-add-member" class="btn ghost small" type="button" hidden>Group info</button>
             </div>
           </header>
           <div class="thread-tools">
             <div class="seg" role="tablist">
               <button id="filter-all" class="seg-btn active" type="button">All</button>
               <button id="filter-pinned" class="seg-btn" type="button">Pinned</button>
+              <button id="filter-tasks" class="seg-btn" type="button" hidden>Tasks</button>
             </div>
             <input id="chat-search" class="chat-search" type="search" placeholder="Search this chat" autocomplete="off" />
           </div>
           <div id="filter-status" class="filter-status" hidden></div>
           <div id="messages" class="messages"></div>
+          <div id="tasks-panel" class="tasks-panel" hidden>
+            <form id="task-form" class="task-form">
+              <input id="task-title" maxlength="200" placeholder="New task" autocomplete="off" />
+              <select id="task-kind" aria-label="Task type">
+                <option value="check">Checkbox</option>
+                <option value="percent">Percent</option>
+              </select>
+              <button class="btn primary" type="submit">Add</button>
+            </form>
+            <p id="task-error" class="error" hidden></p>
+            <div id="task-list" class="task-list"></div>
+          </div>
           <div id="blocked-note" class="blocked-note" hidden>
             <span id="blocked-text"></span>
             <button id="blocked-unblock" class="btn ghost small" type="button">Unblock</button>
@@ -109,6 +122,8 @@
               +
               <input id="file-input" type="file" multiple />
             </label>
+            <button id="emoji-btn" class="icon-btn" type="button" title="Emojis">☺</button>
+            <button id="fx-btn" class="icon-btn fx-btn" type="button" title="Fancy message: styles, screen effects, music">✨</button>
             <input id="compose-input" placeholder="Message" maxlength="2000" autocomplete="off" />
             <button class="btn primary" type="submit">Send</button>
           </form>
@@ -205,6 +220,12 @@
         </section>
 
         <section class="settings-section">
+          <h3>Emojis</h3>
+          <p>Make packs of your own emojis and GIF emojis.</p>
+          <button id="settings-emojis" class="btn ghost small" type="button">Manage emojis</button>
+        </section>
+
+        <section class="settings-section">
           <h3>Blocked people</h3>
           <div id="blocked-list" class="blocked-list"></div>
         </section>
@@ -235,6 +256,156 @@
       </form>
     </dialog>
 
+
+    <!-- Group info -->
+    <dialog id="groupinfo-dialog" class="groupinfo-dialog">
+      <div class="groupinfo">
+        <button id="groupinfo-close" class="icon-close" type="button" aria-label="Close">×</button>
+        <label class="group-pfp" title="Change group picture">
+          <img id="groupinfo-avatar" class="profile-avatar" src="/assets/SmallLogo.png" alt="" />
+          <span>Change picture</span>
+          <input id="groupinfo-avatar-input" type="file" accept="image/*,.gif" />
+        </label>
+        <div class="groupinfo-name">
+          <input id="groupinfo-name" maxlength="40" aria-label="Group name" />
+          <button id="groupinfo-rename" class="btn primary small" type="button">Save</button>
+        </div>
+        <p id="groupinfo-note" class="hint"></p>
+        <h3>People</h3>
+        <div id="groupinfo-members" class="member-list"></div>
+        <div class="groupinfo-add">
+          <input id="groupinfo-add-name" maxlength="24" placeholder="Add someone by username" autocomplete="off" />
+          <button id="groupinfo-add" class="btn ghost small" type="button">Add</button>
+        </div>
+        <p id="groupinfo-error" class="error" hidden></p>
+        <button id="groupinfo-leave" class="btn ghost danger" type="button">Leave group</button>
+      </div>
+    </dialog>
+
+    <!-- Emoji manager -->
+    <dialog id="emoji-dialog" class="emoji-dialog">
+      <form method="dialog">
+        <h2>Your emojis</h2>
+        <p>Upload images or GIFs (transparent backgrounds work). Use them by typing <code>:name:</code> or picking them from ☺.</p>
+        <div class="new-pack">
+          <input id="new-pack-name" maxlength="40" placeholder="New pack name" />
+          <button id="new-pack" class="btn primary small" type="button">Create pack</button>
+        </div>
+        <p id="emoji-error" class="error" hidden></p>
+        <div id="pack-list" class="pack-list"></div>
+        <div class="dialog-actions">
+          <button class="btn ghost" value="close" type="submit">Done</button>
+        </div>
+      </form>
+    </dialog>
+
+    <!-- Emoji picker -->
+    <div id="emoji-picker" class="emoji-picker" hidden>
+      <div id="emoji-picker-body" class="emoji-picker-body"></div>
+      <button id="emoji-manage" class="btn ghost small" type="button">Manage emojis…</button>
+    </div>
+
+    <!-- Fancy message editor -->
+    <dialog id="fx-dialog" class="fx-dialog">
+      <form method="dialog" id="fx-form">
+        <div class="fx-head">
+          <h2>Fancy message</h2>
+          <button id="fx-close" class="icon-close" type="button" aria-label="Close">×</button>
+        </div>
+
+        <div class="fx-toolbar" id="fx-toolbar">
+          <button type="button" data-cmd="b" title="Bold"><b>B</b></button>
+          <button type="button" data-cmd="i" title="Italic"><i>I</i></button>
+          <button type="button" data-cmd="u" title="Underline"><u>U</u></button>
+          <button type="button" data-cmd="s" title="Strikethrough"><s>S</s></button>
+          <label class="tool-color" title="Text color">
+            <span>Color</span>
+            <input id="fx-color" type="color" value="#e0457b" />
+          </label>
+          <button type="button" data-cmd="c" title="Apply color">Apply color</button>
+          <span class="tool-sep"></span>
+          <span class="tool-grad">
+            <span>Gradient</span>
+            <select id="fx-grad-count" aria-label="Number of gradient colors">
+              <option>2</option><option selected>3</option><option>4</option><option>5</option><option>6</option>
+            </select>
+            <span id="fx-grad-colors" class="grad-colors"></span>
+            <button type="button" data-cmd="g">Apply</button>
+          </span>
+          <span class="tool-sep"></span>
+          <button type="button" data-cmd="rb" class="rainbow-label">Rainbow</button>
+          <button type="button" data-cmd="w">Wiggle</button>
+          <button type="button" data-cmd="sh">Shake</button>
+          <button type="button" data-cmd="gl">Glow</button>
+          <select id="fx-size" aria-label="Text size">
+            <option value="">Size</option>
+            <option value="12">Tiny</option>
+            <option value="14">Small</option>
+            <option value="16">Normal</option>
+            <option value="22">Big</option>
+            <option value="30">Huge</option>
+            <option value="44">Massive</option>
+          </select>
+          <button type="button" id="fx-emoji" title="Insert emoji">☺</button>
+          <button type="button" data-cmd="clear" title="Remove styles from selection">Clear style</button>
+        </div>
+        <div id="fx-editor" class="fx-editor" contenteditable="true" spellcheck="true" data-placeholder="Type, select some text, then pick a style…"></div>
+
+        <section class="fx-section">
+          <h3>Screen effect <span class="hint-inline">plays once when they open the chat, up to 10 seconds</span></h3>
+          <div class="fx-stage-wrap">
+            <div id="fx-stage" class="fx-stage"><span class="stage-hint">Their screen. Add an image or GIF, then drag it where you want.</span></div>
+          </div>
+          <div class="fx-row">
+            <label class="btn ghost small file-btn">
+              Add image / GIF
+              <input id="fx-overlay-input" type="file" accept="image/*" multiple />
+            </label>
+          </div>
+          <div id="fx-overlay-edit" class="fx-overlay-edit" hidden>
+            <label>Size <input id="fx-ov-size" type="range" min="2" max="100" step="1" /> <span id="fx-ov-size-val"></span></label>
+            <label>Show from <input id="fx-ov-start" type="number" min="0" max="9.5" step="0.5" />s to <input id="fx-ov-end" type="number" min="0.5" max="10" step="0.5" />s</label>
+            <button id="fx-ov-remove" class="btn ghost small danger" type="button">Remove</button>
+          </div>
+        </section>
+
+        <section class="fx-section">
+          <h3>Music <span class="hint-inline">up to 10 seconds</span></h3>
+          <div class="fx-row music-kind">
+            <label><input type="radio" name="fx-music" value="none" checked /> None</label>
+            <label><input type="radio" name="fx-music" value="file" /> MP3 / audio file</label>
+            <label><input type="radio" name="fx-music" value="yt" /> YouTube link</label>
+          </div>
+          <div id="fx-music-file" class="fx-row" hidden>
+            <label class="btn ghost small file-btn">
+              Choose audio
+              <input id="fx-audio-input" type="file" accept="audio/*,.mp3" />
+            </label>
+            <span id="fx-audio-name" class="hint-inline"></span>
+          </div>
+          <div id="fx-music-yt" class="fx-row" hidden>
+            <input id="fx-yt-url" placeholder="https://www.youtube.com/watch?v=…" />
+          </div>
+          <div id="fx-music-times" class="fx-row" hidden>
+            <label>Start <input id="fx-music-start" placeholder="0:00" /></label>
+            <label>End <input id="fx-music-end" placeholder="0:10" /></label>
+            <label>Volume <input id="fx-music-vol" type="range" min="0" max="1" step="0.05" value="0.8" /></label>
+          </div>
+        </section>
+
+        <p id="fx-error" class="error" hidden></p>
+        <div class="dialog-actions">
+          <button id="fx-preview" class="btn ghost" type="button">▶ Preview</button>
+          <button id="fx-send" class="btn primary" type="button">Send</button>
+        </div>
+      </form>
+    </dialog>
+
+    <!-- Where screen effects play -->
+    <div id="fx-layer" class="fx-layer" hidden>
+      <button id="fx-skip" class="fx-skip" type="button">Skip ✕</button>
+    </div>
+
     <!-- Click an image to enlarge it -->
     <div id="lightbox" class="lightbox" hidden>
       <div class="lightbox-bar">
@@ -247,6 +418,8 @@
 
     <script src="/socket.io/socket.io.js"></script>
     <script src="/theme.js"></script>
+    <script src="/fx.js"></script>
     <script src="/app.js"></script>
+    <script src="/groups.js"></script>
   </body>
 </html>
