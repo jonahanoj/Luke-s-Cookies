@@ -190,6 +190,10 @@ const Extras = (() => {
       else if (!tooBig) item("📌 Pin (keep past the wipe)", () => pinMessage(message, true));
       if (message.mine && !special) item("✏️ Edit", () => Fx.openEditForMessage(message));
       if (message.mine && !message.forwarded && message.fx?.crumb) item("✏️ Edit crumb", () => Crumbs.openEdit(message));
+      if (message.fx?.crumb) {
+        item("🍪 Remix crumb", () => Crumbs.remix(message));
+        item("📋 Copy crumb code", () => Crumbs.copyCodeOf(message));
+      }
       if (message.mine) item("🗑 Delete", () => deleteMessage(message, false), true);
     } else if (message.mine) {
       item("🗑 Remove", () => deleteMessage(message, false), true);
