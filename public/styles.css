@@ -480,6 +480,7 @@ textarea:focus {
 /* ---------- chat ---------- */
 .chat {
   min-height: 0;
+  min-width: 0; /* wide content can't stretch the chat past the screen */
   background: var(--cream);
   display: flex;
   flex-direction: column;
@@ -504,6 +505,7 @@ textarea:focus {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  min-width: 0;
 }
 
 .thread-top {
@@ -3014,7 +3016,8 @@ html.scr-shake {
 /* ================= crumbs ================= */
 .crumb-wrap {
   margin-top: 4px;
-  width: min(320px, 72vw);
+  width: 320px;
+  max-width: 100%; /* never wider than its message bubble */
 }
 
 .crumb-head {
@@ -3370,6 +3373,53 @@ html.scr-shake {
   padding-left: 12px;
 }
 
+.cb-move {
+  flex-basis: 100%;
+}
+
+.cb-move-hint {
+  font-size: 12px;
+  color: var(--muted);
+  margin: 2px 0 4px;
+}
+
+.cb-move-card {
+  width: min(220px, 100%);
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.cb-move-card .crumb-el {
+  cursor: crosshair;
+  pointer-events: none;
+  transition: none;
+}
+
+.cb-move-card .cb-move-from {
+  opacity: 0.3;
+  filter: grayscale(1);
+}
+
+.cb-move-card .cb-move-ghost {
+  z-index: 3;
+  outline: 2px dashed #4d9dff;
+  outline-offset: 2px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+}
+
+.cb-move-ghost-blank {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(77, 157, 255, 0.18);
+  border-radius: 6px;
+  color: #1d5fbf;
+  font-size: 11px;
+  font-weight: 700;
+  pointer-events: none;
+}
+
 .cb-foot {
   display: flex;
   justify-content: flex-end;
@@ -3410,9 +3460,6 @@ html.scr-shake {
   .poll-card,
   .theme-card,
   .roulette-card,
-  .crumb-wrap {
-    width: min(320px, 74vw);
-  }
 }
 
 .cb-cond {

@@ -87,6 +87,11 @@
           return el ? { a: a.a, el, n: Math.round(clamp(a.n, -1e6, 1e6, a.a === "add" ? 1 : 0)) } : null;
         case "move":
           return el ? { a: "move", el, x: clamp(a.x, 0, 100, 50), y: clamp(a.y, 0, 100, 50) } : null;
+        case "addc": {
+          // add one counter's number onto another counter
+          const from = ids.has(a.from) ? a.from : null;
+          return el && from ? { a: "addc", from, el } : null;
+        }
         case "start":
         case "stop":
           return timerIds.has(a.timer) ? { a: a.a, timer: a.timer } : null;
@@ -231,10 +236,12 @@
           if (el) state.pos[el] = { x: a.x, y: a.y };
           break;
         case "add":
+        case "addc":
         case "set": {
           if (!el) break;
           const before = { ...state.num };
-          state.num[el] = a.a === "add" ? (state.num[el] || 0) + a.n : a.n;
+          const amount = a.a === "addc" ? state.num[a.from] || 0 : a.n;
+          state.num[el] = a.a === "set" ? amount : Math.max(-1e9, Math.min(1e9, (state.num[el] || 0) + amount));
           // "when counter reaches N" rules fire when the condition becomes true.
           def.rules.forEach((rule, index) => {
             if (rule.when.on !== "count" || rule.when.el !== el) return;

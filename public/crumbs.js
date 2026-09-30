@@ -842,6 +842,74 @@ const Crumbs = (() => {
     return row;
   }
 
+  // A little copy of the card where you drag a ghost to where the thing
+  // should move to (no numbers to type).
+  function movePicker(rule, action) {
+    const box = document.createElement("div");
+    box.className = "cb-move";
+    const hint = document.createElement("div");
+    hint.className = "cb-move-hint";
+    hint.textContent = "to here — drag it where it should go:";
+    const mini = document.createElement("div");
+    mini.className = "crumb-card cb-move-card";
+    const preview = sanitizedPreview() || { elements: [], timers: [], rules: [], aspect: def.aspect, bg: def.bg };
+    const state = E.initialState(preview);
+    for (const el of def.elements) state.vis[el.id] = !el.hidden;
+    state.pos = {};
+    draw(mini, def, state, { assetUrl: localUrl, now: () => Date.now(), editing: true });
+    const targetId = action.el === "@pressed" ? (rule.when?.on === "press" ? rule.when.el : null) : action.el;
+    const target = def.elements.find((e) => e.id === targetId);
+    const w = target ? target.w : 20;
+    const h = target ? target.h : 12;
+    const from = mini.querySelector(`[data-el="${targetId}"]`);
+    // The ghost looks like the real thing, so you can see where it'll end up.
+    let ghost;
+    if (from) {
+      ghost = from.cloneNode(true);
+      ghost.removeAttribute("data-el");
+      ghost.classList.remove("crumb-hidden", "selected");
+      ghost.classList.add("cb-move-ghost");
+      from.classList.add("cb-move-from");
+    } else {
+      ghost = document.createElement("div");
+      ghost.className = "cb-move-ghost cb-move-ghost-blank";
+      ghost.textContent = "pressed one";
+    }
+    ghost.style.width = `${w}%`;
+    ghost.style.height = `${h}%`;
+    const place = () => {
+      ghost.style.left = `${action.x}%`;
+      ghost.style.top = `${action.y}%`;
+    };
+    place();
+    mini.append(ghost);
+    const setFrom = (event) => {
+      const r = mini.getBoundingClientRect();
+      const cx = ((event.clientX - r.left) / r.width) * 100;
+      const cy = ((event.clientY - r.top) / r.height) * 100;
+      action.x = Math.round(Math.min(100 - w, Math.max(0, cx - w / 2)));
+      action.y = Math.round(Math.min(100 - h, Math.max(0, cy - h / 2)));
+      place();
+    };
+    mini.addEventListener("pointerdown", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      setFrom(event);
+      mini.setPointerCapture?.(event.pointerId);
+      const move = (ev) => setFrom(ev);
+      const up = () => {
+        mini.removeEventListener("pointermove", move);
+        mini.removeEventListener("pointerup", up);
+        mini.removeEventListener("pointercancel", up);
+      };
+      mini.addEventListener("pointermove", move);
+      mini.addEventListener("pointerup", up);
+      mini.addEventListener("pointercancel", up);
+    });
+    box.append(hint, mini);
+    return box;
+  }
+
   const ACTIONS = [
     ["show", "show"],
     ["hide", "hide"],
@@ -851,6 +919,7 @@ const Crumbs = (() => {
     ["image", "change image of"],
     ["add", "add to counter"],
     ["set", "set counter"],
+    ["addc", "add counter onto counter"],
     ["move", "move"],
     ["start", "start timer"],
     ["stop", "stop timer"],
@@ -883,6 +952,11 @@ const Crumbs = (() => {
         fresh.el = counter;
         fresh.n = v === "add" ? 1 : 0;
       }
+      if (v === "addc") {
+        const counters = def.elements.filter((e) => e.type === "counter");
+        fresh.from = counters[0]?.id || first;
+        fresh.el = counters[1]?.id || counters[0]?.id || first;
+      }
       if (v === "move") {
         fresh.x = 50;
         fresh.y = 50;
@@ -911,7 +985,12 @@ const Crumbs = (() => {
         action.a === "image"
           ? [["@pressed", "the pressed one"], ...elOptions.filter(([id]) => def.elements.find((e) => e.id === id)?.type === "image")]
           : withPressed();
-      row.append(selectEl(opts, action.el, (v) => (action.el = v)));
+      row.append(
+        selectEl(opts, action.el, (v) => {
+          action.el = v;
+          if (action.a === "move") paintRules(); // resize the preview ghost
+        })
+      );
     }
     if (action.a === "wait") {
       row.append(
@@ -934,6 +1013,16 @@ const Crumbs = (() => {
         selectEl(withPressed(), action.el, (v) => (action.el = v))
       );
     }
+    if (action.a === "addc") {
+      const counters = elOptions.filter(([id]) => def.elements.find((e) => e.id === id)?.type === "counter");
+      const onto = document.createElement("span");
+      onto.textContent = "onto";
+      row.append(
+        selectEl(counters, action.from, (v) => (action.from = v)),
+        onto,
+        selectEl(counters, action.el, (v) => (action.el = v))
+      );
+    }
     if (action.a === "add" || action.a === "set") {
       row.append(
         selectEl(elOptions.filter(([id]) => def.elements.find((e) => e.id === id)?.type === "counter"), action.el, (v) => (action.el = v)),
@@ -942,12 +1031,7 @@ const Crumbs = (() => {
     }
     if (action.a === "text") row.append(inputEl("text", action.text, (v) => (action.text = v), { maxLength: 200 }));
     if (action.a === "color") row.append(inputEl("color", action.color, (v) => (action.color = v)));
-    if (action.a === "move") {
-      row.append(
-        inputEl("number", action.x, (v) => (action.x = v), { className: "cb-num", title: "x %" }),
-        inputEl("number", action.y, (v) => (action.y = v), { className: "cb-num", title: "y %" })
-      );
-    }
+    if (action.a === "move") row.append(movePicker(rule, action));
     if (action.a === "image" || action.a === "sound") {
       const pick = document.createElement("button");
       pick.type = "button";
