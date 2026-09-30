@@ -2176,3 +2176,17 @@ dialog p.field-label {
 .ed-shake {
   white-space: pre;
 }
+
+/* ---------- deleted messages ---------- */
+.row.deleted-row {
+  align-self: center;
+  max-width: 100%;
+}
+
+.deleted-note {
+  font-size: 13px;
+  font-style: italic;
+  color: var(--muted);
+  padding: 4px 12px;
+  border: 1px dashed var(--line);
+}

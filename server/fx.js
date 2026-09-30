@@ -57,7 +57,8 @@ export function spansToText(spans) {
 }
 
 // assetIds: attachment ids uploaded with this message as fx assets, in order.
-export function sanitizeFx(raw, assetIds) {
+// existingIds: fx asset ids already on the message (when editing).
+export function sanitizeFx(raw, assetIds, existingIds = new Set()) {
   if (!raw || typeof raw !== "object") return null;
   const fx = {};
 
@@ -83,7 +84,8 @@ export function sanitizeFx(raw, assetIds) {
   if (effect) {
     const out = {};
     const assetFor = (value) => {
-      const index = Number(value);
+      if (typeof value === "string" && existingIds.has(value)) return value;
+      const index = typeof value === "number" ? value : NaN;
       return Number.isInteger(index) && assetIds[index] ? assetIds[index] : null;
     };
     if (Array.isArray(effect.overlays)) {

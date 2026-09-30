@@ -322,6 +322,8 @@ function connectSocket() {
   socket = io();
   socket.on("connect", sendPresence);
   socket.on("message", (payload) => {
+    // Start loading effect media right away so it's ready when the chat opens.
+    if (payload.fx?.effect && !payload.mine) Fx.prewarm(payload);
     refreshConversations();
     if (payload.pinned || sideTab === "pinned") refreshPinned();
     if (payload.conversationId !== activeId) return;
@@ -617,6 +619,20 @@ function upsertMessage(message, replace = false) {
   if (existing && !replace) return;
   activeMessages.set(message.id, message);
 
+  if (message.deleted) {
+    const row = document.createElement("div");
+    row.className = "row deleted-row";
+    row.dataset.id = message.id;
+    const note = document.createElement("div");
+    note.className = "deleted-note";
+    note.textContent = "Deleted message";
+    row.append(note);
+    if (existing) existing.replaceWith(row);
+    else messagesEl.append(row);
+    applyFilterToRow(row, message);
+    return;
+  }
+
   const whoName = message.mine ? "You" : message.username || activeChat?.username || "Them";
   const profileName = message.mine ? me?.username : message.username;
   const row = document.createElement("div");
@@ -654,6 +670,34 @@ function upsertMessage(message, replace = false) {
       Fx.playMessage(message);
     });
     top.append(replay);
+  }
+
+  if (message.mine) {
+    const edit = document.createElement("button");
+    edit.type = "button";
+    edit.className = "pin-btn";
+    edit.textContent = "Edit";
+    edit.addEventListener("click", (event) => {
+      event.stopPropagation();
+      Fx.openEditForMessage(message);
+    });
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "pin-btn";
+    del.textContent = "Delete";
+    del.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      if (!confirm("Delete this message? It will show as \"Deleted message\".")) return;
+      try {
+        const updated = await api(`/api/messages/${message.id}`, { method: "DELETE" });
+        upsertMessage(updated, true);
+        refreshConversations();
+        refreshPinned();
+      } catch (err) {
+        showError(composeError, err.message);
+      }
+    });
+    top.append(edit, del);
   }
 
   if (!message.blocked) {
@@ -700,7 +744,7 @@ function upsertMessage(message, replace = false) {
   const files = renderAttachments(message);
   if (files) bubble.append(files);
   const time = document.createElement("time");
-  time.textContent = formatTime(message.createdAt);
+  time.textContent = formatTime(message.createdAt) + (message.edited ? " · edited" : "");
   bubble.append(time);
 
   // While filtering, clicking a result jumps to it in the full chat.
@@ -727,6 +771,7 @@ async function loadMessages(conversationId) {
   for (const message of data.messages) upsertMessage(message);
   applyFilter();
   messagesEl.scrollTop = messagesEl.scrollHeight;
+  for (const message of data.messages.filter((m) => m.fx?.effect).slice(-3)) Fx.prewarm(message);
   Fx.autoplay(data.messages);
 }
 

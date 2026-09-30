@@ -219,6 +219,7 @@ const Fx = (() => {
   }
 
   function stop() {
+    playToken += 1;
     if (!playing) return;
     const current = playing;
     playing = null;
@@ -263,11 +264,146 @@ const Fx = (() => {
     node.style.setProperty("--rot", `${overlay.r || 0}deg`);
   }
 
-  // effect: { overlays: [{a,x,y,w,s,e}], music: {a|yt, s, e, v} }
+  // ---------- preloading, so effects start instantly ----------
+  // YouTube players and audio are created ahead of time, buffered while muted,
+  // then paused at the clip start. Playing one is then just "unmute + play".
+  const warmYt = new Map(); // "id@start" -> { player, holder, ready }
+  const warmAudio = new Map(); // url -> Audio
+  const warmImages = new Map(); // url -> Promise
+
+  function trimCache(map, max, dispose) {
+    while (map.size > max) {
+      const [key, value] = map.entries().next().value;
+      map.delete(key);
+      dispose?.(value);
+    }
+  }
+
+  function prepareYouTube(music) {
+    const key = `${music.yt}@${music.s}`;
+    if (warmYt.has(key)) return warmYt.get(key).ready;
+    const holder = document.createElement("div");
+    holder.className = "fx-yt";
+    const target = document.createElement("div");
+    holder.append(target);
+    document.body.append(holder);
+    const entry = { holder, player: null, primed: false };
+    entry.ready = loadYouTubeApi()
+      .then(
+        (YT) =>
+          new Promise((resolve) => {
+            const done = () => resolve(entry);
+            const timer = setTimeout(done, 6000);
+            entry.player = new YT.Player(target, {
+              width: 200,
+              height: 113,
+              videoId: music.yt,
+              playerVars: { autoplay: 0, controls: 0, playsinline: 1, disablekb: 1 },
+              events: {
+                onReady: (event) => {
+                  event.target.mute();
+                  event.target.seekTo(music.s, true);
+                  event.target.playVideo();
+                },
+                onStateChange: (event) => {
+                  if (entry.primed || event.data !== YT.PlayerState.PLAYING) return;
+                  entry.primed = true;
+                  event.target.pauseVideo();
+                  event.target.seekTo(music.s, true);
+                  clearTimeout(timer);
+                  done();
+                },
+              },
+            });
+          })
+      )
+      .catch(() => entry);
+    warmYt.set(key, entry);
+    trimCache(warmYt, 6, (old) => {
+      try {
+        old.player?.destroy();
+      } catch {
+        // ignore
+      }
+      old.holder.remove();
+    });
+    return entry.ready;
+  }
+
+  function prepareAudio(url, start) {
+    if (!warmAudio.has(url)) {
+      const audio = new Audio();
+      audio.preload = "auto";
+      audio.src = url;
+      audio.load();
+      warmAudio.set(url, audio);
+      trimCache(warmAudio, 8, (old) => {
+        old.pause();
+        old.src = "";
+      });
+    }
+    const audio = warmAudio.get(url);
+    return new Promise((resolve) => {
+      const ready = () => {
+        try {
+          audio.currentTime = start || 0;
+        } catch {
+          // ignore
+        }
+        resolve(audio);
+      };
+      if (audio.readyState >= 3) ready();
+      else {
+        audio.addEventListener("canplaythrough", ready, { once: true });
+        audio.addEventListener("error", () => resolve(audio), { once: true });
+      }
+    });
+  }
+
+  function prepareImage(url) {
+    if (!warmImages.has(url)) {
+      const img = new Image();
+      img.src = url;
+      warmImages.set(
+        url,
+        (img.decode ? img.decode() : Promise.resolve()).catch(() => {})
+      );
+      trimCache(warmImages, 40);
+    }
+    return warmImages.get(url);
+  }
+
+  // Start loading everything an effect needs. Resolves when ready (or soon).
+  function prepare(effect, urlFor) {
+    if (!effect) return Promise.resolve();
+    const jobs = (effect.overlays || []).map((o) => prepareImage(urlFor(o.a)));
+    if (effect.music?.yt) jobs.push(prepareYouTube(effect.music));
+    else if (effect.music?.a) jobs.push(prepareAudio(urlFor(effect.music.a), effect.music.s));
+    return Promise.all(jobs);
+  }
+
+  const assetUrl = (id) => `/api/attachments/${id}`;
+
+  function prewarm(message) {
+    if (message?.fx?.effect) prepare(message.fx.effect, assetUrl).catch(() => {});
+  }
+
+  // effect: { overlays: [{a,x,y,w,r,s,e}], music: {a|yt, s, e, v} }
   // urlFor(assetId) gives the image/audio URL.
-  function play(effect, urlFor) {
+  let playToken = 0;
+  async function play(effect, urlFor) {
     stop();
     if (!effect) return;
+    const token = ++playToken;
+    // Wait for preloading (instant if it was already warmed up), but never
+    // hold things up for more than a moment.
+    await Promise.race([prepare(effect, urlFor), new Promise((r) => setTimeout(r, 2500))]);
+    if (token !== playToken) return;
+    start(effect, urlFor);
+  }
+
+  function start(effect, urlFor) {
+    stop();
     const el = layer();
     const state = { timers: [], cleanup: [] };
     playing = state;
@@ -284,11 +420,11 @@ const Fx = (() => {
       img.alt = "";
       placeOverlay(img, overlay);
       frame.append(img);
-      const start = Math.max(0, overlay.s || 0) * 1000;
+      const startAt = Math.max(0, overlay.s || 0) * 1000;
       const end = Math.min(MAX_SECONDS, overlay.e || MAX_SECONDS) * 1000;
       total = Math.max(total, end);
-      state.timers.push(setTimeout(() => img.classList.add("on"), start));
-      state.timers.push(setTimeout(() => img.classList.remove("on"), Math.max(start, end - 400)));
+      state.timers.push(setTimeout(() => img.classList.add("on"), startAt));
+      state.timers.push(setTimeout(() => img.classList.remove("on"), Math.max(startAt, end - 400)));
     }
 
     const music = effect.music;
@@ -297,62 +433,49 @@ const Fx = (() => {
       total = Math.max(total, length);
       const volume = music.v ?? 0.8;
       if (music.yt) {
-        const holder = document.createElement("div");
-        holder.className = "fx-yt";
-        const target = document.createElement("div");
-        holder.append(target);
-        document.body.append(holder);
-        let player = null;
-        state.cleanup.push(() => {
+        const entry = warmYt.get(`${music.yt}@${music.s}`);
+        const player = entry?.player;
+        if (player?.playVideo) {
           try {
-            player?.destroy();
+            player.seekTo(music.s, true);
+            player.setVolume(Math.round(volume * 100));
+            player.unMute();
+            player.playVideo();
           } catch {
             // ignore
           }
-          holder.remove();
-        });
-        loadYouTubeApi()
-          .then((YT) => {
-            if (playing !== state) return;
-            player = new YT.Player(target, {
-              width: 200,
-              height: 113,
-              videoId: music.yt,
-              playerVars: {
-                autoplay: 1,
-                controls: 0,
-                start: Math.floor(music.s),
-                end: Math.ceil(music.e),
-                playsinline: 1,
-              },
-              events: {
-                onReady: (event) => {
-                  event.target.setVolume(Math.round(volume * 100));
-                  event.target.seekTo(music.s, true);
-                  event.target.playVideo();
-                },
-              },
-            });
-          })
-          .catch(() => {});
+          const halt = () => {
+            try {
+              player.pauseVideo();
+              player.mute();
+              player.seekTo(music.s, true);
+            } catch {
+              // ignore
+            }
+          };
+          state.timers.push(setTimeout(halt, length));
+          state.cleanup.push(halt);
+        }
       } else if (music.a) {
-        const audio = new Audio(urlFor(music.a));
+        const url = urlFor(music.a);
+        const audio = warmAudio.get(url) || new Audio(url);
         audio.volume = volume;
-        audio.preload = "auto";
-        const begin = () => {
+        try {
+          audio.currentTime = music.s || 0;
+        } catch {
+          // ignore
+        }
+        audio.play().catch(() => {});
+        const halt = () => {
+          audio.pause();
           try {
             audio.currentTime = music.s || 0;
           } catch {
             // ignore
           }
-          audio.play().catch(() => {});
         };
-        if (audio.readyState >= 1) begin();
-        else audio.addEventListener("loadedmetadata", begin, { once: true });
-        state.cleanup.push(() => {
-          audio.pause();
-          audio.src = "";
-        });
+        state.timers.push(setTimeout(halt, length));
+        state.cleanup.push(halt);
       }
     }
 
@@ -366,7 +489,7 @@ const Fx = (() => {
   function playMessage(message) {
     const effect = message.fx?.effect;
     if (!effect) return;
-    play(effect, (id) => `/api/attachments/${id}`);
+    play(effect, assetUrl);
   }
 
   // Plays the newest unseen effect someone else sent (one at a time, so
@@ -673,6 +796,7 @@ const Fx = (() => {
   let selectedOverlay = null;
   let audioFile = null;
   let nextOverlayId = 1;
+  let editingId = null; // set while editing an existing message
 
   function cleanStyle(st) {
     const out = {};
@@ -1319,10 +1443,13 @@ const Fx = (() => {
     editor.replaceChildren();
     pending = null;
     paintPending();
-    for (const item of overlays) URL.revokeObjectURL(item.url);
+    for (const item of overlays) if (!item.existingId) URL.revokeObjectURL(item.url);
     overlays = [];
     selectedOverlay = null;
+    if (audioFile && !audioFile.existingId) URL.revokeObjectURL(audioFile.url);
     audioFile = null;
+    editingId = null;
+    paintMode();
     document.getElementById("fx-audio-name").textContent = "";
     document.getElementById("fx-yt-url").value = "";
     document.getElementById("fx-music-start").value = "";
@@ -1334,8 +1461,61 @@ const Fx = (() => {
     showError(fxError, "");
   }
 
+  function paintMode() {
+    editorDialog.querySelector(".fx-head h2").textContent = editingId ? "Edit message" : "Fancy message";
+    document.getElementById("fx-send").textContent = editingId ? "Save" : "Send";
+  }
+
+  // Load a sent message into the editor so its text and effect can be changed.
+  function openEditForMessage(message) {
+    stop();
+    resetEditor();
+    editingId = message.id;
+    paintMode();
+    const spans = message.fx?.spans || (message.body ? [{ t: message.body }] : []);
+    const model = [];
+    for (const span of spans) {
+      if (span.e) model.push({ e: span.e, st: {} });
+      else {
+        const { t, ...st } = span;
+        for (const ch of t) model.push({ t: ch, st: cleanStyle(st) });
+      }
+    }
+    renderModel(model);
+    const effect = message.fx?.effect;
+    for (const o of effect?.overlays || []) {
+      overlays.push({
+        id: nextOverlayId++,
+        existingId: o.a,
+        url: `/api/attachments/${o.a}`,
+        x: o.x,
+        y: o.y,
+        w: o.w,
+        r: o.r || 0,
+        s: o.s,
+        e: o.e,
+      });
+    }
+    selectedOverlay = overlays[0] || null;
+    const music = effect?.music;
+    if (music) {
+      const kind = music.yt ? "yt" : "file";
+      document.querySelector(`input[name="fx-music"][value="${kind}"]`).checked = true;
+      if (music.yt) document.getElementById("fx-yt-url").value = `https://youtu.be/${music.yt}`;
+      else {
+        audioFile = { existingId: music.a, url: `/api/attachments/${music.a}` };
+        document.getElementById("fx-audio-name").textContent = "Current audio";
+      }
+      document.getElementById("fx-music-start").value = formatTime(music.s);
+      document.getElementById("fx-music-end").value = formatTime(music.e);
+      document.getElementById("fx-music-vol").value = String(music.v ?? 0.8);
+    }
+    openEditor();
+  }
+
   function openEditor(initialText = "") {
     if (!activeId) return;
+    paintMode();
     if (!editor.childNodes.length && initialText) {
       renderModel([...initialText].map((ch) => ({ t: ch, st: {} })));
     }
@@ -1358,6 +1538,7 @@ const Fx = (() => {
       effect.overlays = overlays.map((item) => {
         let a;
         if (forPreview) a = item.url;
+        else if (item.existingId) a = item.existingId;
         else {
           a = files.length;
           files.push(item.file);
@@ -1381,6 +1562,7 @@ const Fx = (() => {
         if (!audioFile) throw new Error("Choose an audio file.");
         let a;
         if (forPreview) a = audioFile.url;
+        else if (audioFile.existingId) a = audioFile.existingId;
         else {
           a = files.length;
           files.push(audioFile.file);
@@ -1454,29 +1636,46 @@ const Fx = (() => {
         return;
       }
       button.disabled = true;
-      button.textContent = "Sending…";
-      await sendFx(fx, files, plain);
+      button.textContent = editingId ? "Saving…" : "Sending…";
+      if (editingId) {
+        const form = new FormData();
+        form.append("body", plain);
+        form.append("fx", JSON.stringify(fx));
+        for (const file of files) form.append("fxfiles", file);
+        const updated = await api(`/api/messages/${editingId}`, { method: "PATCH", body: form });
+        upsertMessage(updated, true);
+        refreshConversations();
+      } else {
+        await sendFx(fx, files, plain);
+        composeInput.value = "";
+      }
       stop();
       resetEditor();
       editorDialog.close();
-      composeInput.value = "";
     } catch (err) {
       showError(fxError, err.message);
     } finally {
       button.disabled = false;
-      button.textContent = "Send";
+      paintMode();
     }
   });
 
   document.getElementById("fx-close").addEventListener("click", () => {
     stop();
+    if (editingId) resetEditor();
     editorDialog.close();
+  });
+  editorDialog.addEventListener("cancel", () => {
+    if (editingId) resetEditor();
   });
 
   document.getElementById("fx-skip").addEventListener("click", stop);
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && playing) stop();
   });
+
+  // Get the YouTube player code loading early so the first clip isn't slow.
+  setTimeout(() => loadYouTubeApi().catch(() => {}), 1500);
 
   return {
     Emoji,
@@ -1491,6 +1690,8 @@ const Fx = (() => {
     closePicker,
     openManager,
     openEditor,
+    openEditForMessage,
+    prewarm,
     stop,
   };
 })();

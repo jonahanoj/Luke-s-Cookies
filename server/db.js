@@ -92,6 +92,7 @@ async function pgQuery(text, params = []) {
 }
 
 function previewText(message) {
+  if (message.deleted) return "Deleted message";
   if (message.body) return message.body;
   const file = (message.attachments || []).find((item) => (item.role || "file") === "file");
   if (file?.name) return file.name;
@@ -117,6 +118,8 @@ function mapPgMessage(row) {
     sender_username: row.sender_username || null,
     name_color: row.name_color || "#6e8070",
     fx: parseFx(row.fx),
+    edited_at: row.edited_at || null,
+    deleted: Boolean(row.deleted),
   };
 }
 
@@ -234,6 +237,8 @@ export async function initDb() {
       ALTER TABLE conversations ADD COLUMN IF NOT EXISTS created_by TEXT;
       ALTER TABLE conversations ADD COLUMN IF NOT EXISTS avatar_id TEXT;
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS fx TEXT;
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ;
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted BOOLEAN NOT NULL DEFAULT FALSE;
       ALTER TABLE attachments ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'file';
       CREATE TABLE IF NOT EXISTS tasks (
         id TEXT PRIMARY KEY,
@@ -542,6 +547,7 @@ export async function listConversations(userId) {
          c.avatar_id,
          (
            SELECT COALESCE(
+             CASE WHEN m.deleted THEN 'Deleted message' END,
              NULLIF(m.body, ''),
              (SELECT a.name FROM attachments a WHERE a.message_id = m.id AND a.role = 'file' LIMIT 1),
              CASE WHEN m.fx IS NOT NULL THEN 'Sent an effect' END
@@ -640,6 +646,8 @@ export async function listMessages(conversationId) {
          m.pinned,
          m.created_at,
          m.fx,
+         m.edited_at,
+         m.deleted,
          u.avatar_id,
          u.username AS sender_username,
          u.name_color,
@@ -677,6 +685,8 @@ export async function listMessages(conversationId) {
         sender_username: sender?.username || null,
         name_color: sender?.name_color || "#6e8070",
         fx: message.fx || null,
+        edited_at: message.edited_at || null,
+        deleted: Boolean(message.deleted),
       };
     });
 }
@@ -749,7 +759,7 @@ export async function addMessage(
 export async function getMessage(messageId) {
   if (pool) {
     const rows = await pgQuery(
-      `SELECT m.id, m.conversation_id, m.sender_id, m.body, m.pinned, m.created_at, m.fx,
+      `SELECT m.id, m.conversation_id, m.sender_id, m.body, m.pinned, m.created_at, m.fx, m.edited_at, m.deleted,
               u.avatar_id, u.username AS sender_username, u.name_color
        FROM messages m
        LEFT JOIN users u ON u.id = m.sender_id
@@ -1669,4 +1679,85 @@ export async function copyEmojiPack(packId, ownerId) {
     await addEmoji(pack.id, emoji.name, emoji.file_id, emoji.mime);
   }
   return getEmojiPack(pack.id);
+}
+
+// Replaces a message's text/effect. newFiles are freshly uploaded fx assets;
+// fx assets the new version no longer uses are deleted.
+export async function editMessage(messageId, body, fx, newFiles, keepAssetIds) {
+  const editedAt = new Date().toISOString();
+  const removed = [];
+  if (pool) {
+    const old = await pgQuery(
+      `SELECT id FROM attachments WHERE message_id = $1 AND role = 'fx'`,
+      [messageId]
+    );
+    for (const row of old) if (!keepAssetIds.has(row.id)) removed.push(row.id);
+    if (removed.length) {
+      await pgQuery(`DELETE FROM attachments WHERE id = ANY($1::text[])`, [removed]);
+    }
+    for (const file of newFiles) {
+      await pgQuery(
+        `INSERT INTO attachments (id, message_id, name, mime, size, role) VALUES ($1, $2, $3, $4, $5, 'fx')`,
+        [file.id, messageId, file.name, file.mime, file.size]
+      );
+    }
+    await pgQuery(`UPDATE messages SET body = $1, fx = $2, edited_at = $3 WHERE id = $4`, [
+      body,
+      fx ? JSON.stringify(fx) : null,
+      editedAt,
+      messageId,
+    ]);
+  } else {
+    const message = fileStore.messages.find((item) => item.id === messageId);
+    if (!message) return null;
+    const keep = [];
+    for (const file of message.attachments || []) {
+      if (file.role === "fx" && !keepAssetIds.has(file.id)) removed.push(file.id);
+      else keep.push(file);
+    }
+    for (const file of newFiles) {
+      keep.push({ id: file.id, name: file.name, mime: file.mime, size: file.size, role: "fx" });
+    }
+    message.attachments = keep;
+    message.body = body;
+    message.fx = fx;
+    message.edited_at = editedAt;
+    saveFileStore();
+  }
+  for (const id of removed) {
+    try {
+      fs.unlinkSync(attachmentPath(id));
+    } catch {
+      // already gone
+    }
+  }
+  return getMessage(messageId);
+}
+
+// Deletes the content but leaves a "Deleted message" marker in the chat.
+export async function deleteMessageContent(messageId) {
+  const fileIds = [];
+  if (pool) {
+    const rows = await pgQuery(`SELECT id FROM attachments WHERE message_id = $1`, [messageId]);
+    fileIds.push(...rows.map((row) => row.id));
+    await pgQuery(`DELETE FROM attachments WHERE message_id = $1`, [messageId]);
+    await pgQuery(
+      `UPDATE messages SET body = '', fx = NULL, pinned = FALSE, deleted = TRUE WHERE id = $1`,
+      [messageId]
+    );
+  } else {
+    const message = fileStore.messages.find((item) => item.id === messageId);
+    if (!message) return null;
+    fileIds.push(...(message.attachments || []).map((file) => file.id));
+    Object.assign(message, { body: "", fx: null, pinned: false, deleted: true, attachments: [] });
+    saveFileStore();
+  }
+  for (const id of fileIds) {
+    try {
+      fs.unlinkSync(attachmentPath(id));
+    } catch {
+      // already gone
+    }
+  }
+  return getMessage(messageId);
 }

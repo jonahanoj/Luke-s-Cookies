@@ -68,6 +68,8 @@ import {
   renameEmoji,
   deleteEmoji,
   copyEmojiPack,
+  editMessage,
+  deleteMessageContent,
 } from "./db.js";
 import { sanitizeFx, spansToText, fxAssetIds } from "./fx.js";
 import { makeGifLoop } from "./gifloop.js";
@@ -138,6 +140,22 @@ function attachmentSize(message) {
 
 function publicMessage(message, userId, blocked = null) {
   const mine = message.sender_id === userId;
+  if (message.deleted) {
+    // Nobody sees who deleted it.
+    return {
+      id: message.id,
+      deleted: true,
+      mine: false,
+      username: null,
+      avatarUrl: null,
+      body: "",
+      createdAt: message.created_at,
+      pinned: false,
+      attachments: [],
+      fx: null,
+      totalSize: 0,
+    };
+  }
   if (!mine && blocked?.has(message.sender_id)) {
     return {
       id: message.id,
@@ -182,6 +200,7 @@ function publicMessage(message, userId, blocked = null) {
     attachments,
     fx: message.fx || null,
     fxMime,
+    edited: Boolean(message.edited_at),
     totalSize: all.reduce((sum, file) => sum + file.size, 0),
   };
 }
@@ -1235,6 +1254,95 @@ app.post(
   }
 );
 
+async function ownMessage(req, res) {
+  const message = await getMessage(req.params.id);
+  const conversation = message
+    ? await userInConversation(message.conversation_id, req.user.id)
+    : null;
+  if (!message || !conversation) {
+    res.status(404).json({ error: "Message not found." });
+    return {};
+  }
+  if (message.sender_id !== req.user.id) {
+    res.status(403).json({ error: "You can only change your own messages." });
+    return {};
+  }
+  if (message.deleted) {
+    res.status(400).json({ error: "That message was deleted." });
+    return {};
+  }
+  return { message, conversation };
+}
+
+async function emitMessageUpdated(conversation, updated) {
+  const blockers = await blockerIdsOf(updated.sender_id);
+  emitToConversation(conversation, "message-updated", (userId) => ({
+    conversationId: conversation.id,
+    ...publicMessage(updated, userId, blockers.has(userId) ? new Set([updated.sender_id]) : null),
+  }));
+}
+
+app.patch(
+  "/api/messages/:id",
+  requireUser,
+  upload.fields([{ name: "fxfiles", maxCount: 13 }]),
+  async (req, res) => {
+    const fxFiles = req.files?.fxfiles || [];
+    const { message, conversation } = await ownMessage(req, res);
+    if (!message) {
+      removeFiles(fxFiles);
+      return;
+    }
+    const existing = new Set(
+      (message.attachments || []).filter((file) => file.role === "fx").map((file) => file.id)
+    );
+    let fx = null;
+    if (req.body.fx) {
+      try {
+        fx = sanitizeFx(
+          JSON.parse(String(req.body.fx)),
+          fxFiles.map((file) => file.filename),
+          existing
+        );
+      } catch {
+        fx = null;
+      }
+    }
+    const used = fxAssetIds(fx);
+    const keptNew = fxFiles.filter((file) => used.has(file.filename));
+    removeFiles(fxFiles.filter((file) => !used.has(file.filename)));
+    let body = String(req.body.body || "").trim();
+    if (fx?.spans) body = spansToText(fx.spans).trim();
+    body = body.slice(0, 2000);
+    const hasFiles = (message.attachments || []).some((file) => file.role !== "fx");
+    if (!body && !fx && !hasFiles) {
+      removeFiles(keptNew);
+      res.status(400).json({ error: "A message can't be empty. Delete it instead." });
+      return;
+    }
+    const newFiles = keptNew.map((file) => {
+      const name = path.basename(file.originalname || "file").slice(0, 180);
+      return { id: file.filename, name, mime: guessMime(name, file.mimetype), size: file.size };
+    });
+    for (const file of newFiles) {
+      if (file.mime === "image/gif") makeGifLoop(attachmentPath(file.id));
+    }
+    const keep = new Set([...used].filter((id) => existing.has(id)));
+    const updated = await editMessage(message.id, body, fx, newFiles, keep);
+    await emitMessageUpdated(conversation, updated);
+    res.json(publicMessage(updated, req.user.id));
+  }
+);
+
+app.delete("/api/messages/:id", requireUser, async (req, res) => {
+  const { message, conversation } = await ownMessage(req, res);
+  if (!message) return;
+  const updated = await deleteMessageContent(message.id);
+  await emitMessageUpdated(conversation, updated);
+  emitToConversation(conversation, "username-changed", () => ({}));
+  res.json(publicMessage(updated, req.user.id));
+});
+
 app.post("/api/messages/:id/pin", requireUser, async (req, res) => {
   const message = await getMessage(req.params.id);
   if (!message) {
@@ -1247,6 +1355,10 @@ app.post("/api/messages/:id/pin", requireUser, async (req, res) => {
   );
   if (!conversation) {
     res.status(404).json({ error: "Message not found." });
+    return;
+  }
+  if (message.deleted) {
+    res.status(400).json({ error: "That message was deleted." });
     return;
   }
   if (attachmentSize(message) > MAX_PIN_BYTES) {
