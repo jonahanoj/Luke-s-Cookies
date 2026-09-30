@@ -8,7 +8,7 @@
   const SCREEN_KINDS = ["shake", "flip", "mirror", "spin", "invert", "rainbow", "zoom", "wobble", "tilt", "grayscale"];
   const HEX = /^#[0-9a-fA-F]{6}$/;
   const ID = /^[A-Za-z0-9_-]{1,24}$/;
-  const MAX = { elements: 40, timers: 12, rules: 60, actions: 12, text: 200 };
+  const MAX = { elements: 60, timers: 12, rules: 120, actions: 30, text: 200 };
 
   const clamp = (value, min, max, fallback) => {
     const n = Number(value);
@@ -65,7 +65,8 @@
     for (const el of def.elements) if (el.type === "timer" && !timerIds.has(el.timer)) el.timer = null;
     const cleanAction = (a) => {
       if (!a || typeof a !== "object") return null;
-      const el = ids.has(a.el) ? a.el : null;
+      // "@pressed" = whichever element was just pressed.
+      const el = ids.has(a.el) || a.el === "@pressed" ? a.el : null;
       switch (a.a) {
         case "show":
         case "hide":
@@ -97,9 +98,35 @@
         }
         case "reset":
           return { a: "reset" };
+        case "wait": {
+          // wait until a certain element (or "*" = anything) is pressed
+          const target = ids.has(a.el) || a.el === "*" ? a.el : null;
+          return target ? { a: "wait", el: target, blank: Boolean(a.blank) } : null;
+        }
+        case "delay":
+          return { a: "delay", secs: clamp(a.secs, 0.2, 3600, 1) };
+        case "loop":
+          return { a: "loop" };
+        case "halt":
+          return { a: "halt" };
+        case "copy": {
+          const from = ids.has(a.from) || a.from === "@pressed" ? a.from : null;
+          return el && from ? { a: "copy", from, el } : null;
+        }
         default:
           return null;
       }
+    };
+    const cleanCond = (c) => {
+      if (!c || typeof c !== "object") return null;
+      const el = ids.has(c.el) || c.el === "@pressed" ? c.el : null;
+      if (!el) return null;
+      if (c.k === "text") return { k: "text", el, op: c.op === "!=" ? "!=" : "==", v: str(c.v, MAX.text) };
+      if (c.k === "num" && [">=", "<=", "==", "!="].includes(c.op)) {
+        return { k: "num", el, op: c.op, v: Math.round(clamp(c.v, -1e6, 1e6, 0)) };
+      }
+      if (c.k === "shown") return { k: "shown", el, op: c.op === "!=" ? "!=" : "==" };
+      return null;
     };
     for (const r of (Array.isArray(raw.rules) ? raw.rules : []).slice(0, MAX.rules)) {
       if (!r || !r.when) continue;
@@ -107,12 +134,14 @@
       if (r.when.on === "press" && ids.has(r.when.el)) when = { on: "press", el: r.when.el };
       else if (r.when.on === "timer" && timerIds.has(r.when.timer)) when = { on: "timer", timer: r.when.timer };
       else if (r.when.on === "start") when = { on: "start" };
+      else if (r.when.on === "after") when = { on: "after" };
       else if (r.when.on === "count" && ids.has(r.when.el) && [">=", "<=", "=="].includes(r.when.cmp)) {
         when = { on: "count", el: r.when.el, cmp: r.when.cmp, n: Math.round(clamp(r.when.n, -1e6, 1e6, 10)) };
       }
       if (!when) continue;
-      const actions = (Array.isArray(r.do) ? r.do : []).slice(0, MAX.actions).map(cleanAction).filter(Boolean);
-      if (actions.length) def.rules.push({ when, do: actions });
+      const actions = (Array.isArray(r.do) ? r.do : []).slice(0, 30).map(cleanAction).filter(Boolean);
+      const conds = (Array.isArray(r.if) ? r.if : []).slice(0, 10).map(cleanCond).filter(Boolean);
+      if (actions.length) def.rules.push(conds.length ? { when, if: conds, do: actions } : { when, do: actions });
     }
     return def.elements.length ? def : null;
   }
@@ -125,13 +154,38 @@
   }
 
   function baseState(def) {
-    const state = { vis: {}, text: {}, img: {}, color: {}, num: {}, pos: {}, timers: {}, seq: 0 };
+    const state = { vis: {}, text: {}, img: {}, color: {}, num: {}, pos: {}, timers: {}, waits: [], seq: 0 };
     for (const el of def.elements) {
       state.vis[el.id] = !el.hidden;
       if (el.type === "counter") state.num[el.id] = el.value || 0;
     }
     for (const t of def.timers) state.timers[t.id] = null;
     return state;
+  }
+
+  function textOf(def, state, id) {
+    if (state.text[id] !== undefined) return state.text[id];
+    return def.elements.find((el) => el.id === id)?.text || "";
+  }
+
+  function condsMet(def, state, rule, ctx) {
+    for (const c of rule.if || []) {
+      const id = c.el === "@pressed" ? ctx.pressed : c.el;
+      if (!id) return false;
+      if (c.k === "text") {
+        const same = textOf(def, state, id) === c.v;
+        if ((c.op === "==") !== same) return false;
+      } else if (c.k === "num") {
+        const n = state.num[id] || 0;
+        const ok =
+          c.op === ">=" ? n >= c.v : c.op === "<=" ? n <= c.v : c.op === "==" ? n === c.v : n !== c.v;
+        if (!ok) return false;
+      } else if (c.k === "shown") {
+        const shown = state.vis[id] !== false;
+        if ((c.op === "==") !== shown) return false;
+      }
+    }
+    return true;
   }
 
   function countMatches(rule, state) {
@@ -141,42 +195,54 @@
     return n === rule.when.n;
   }
 
-  // Runs a list of actions; returns effects everyone should see (screen/sound).
-  function run(def, state, actions, now, fired, budget) {
-    for (const a of actions) {
+  // Runs a list of actions. Screen/sound effects go into `fired` for
+  // everyone to see. ctx = { pressed, rule } (who was pressed, which rule).
+  function run(def, state, actions, now, fired, budget, ctx = {}) {
+    const target = (id) => (id === "@pressed" ? ctx.pressed : id);
+    for (let i = 0; i < actions.length; i += 1) {
+      const a = actions[i];
       if (budget.left-- <= 0) return;
+      const el = target(a.el);
       switch (a.a) {
         case "show":
-          state.vis[a.el] = true;
+          if (el) state.vis[el] = true;
           break;
         case "hide":
-          state.vis[a.el] = false;
+          if (el) state.vis[el] = false;
           break;
         case "toggle":
-          state.vis[a.el] = !state.vis[a.el];
+          if (el) state.vis[el] = !state.vis[el];
           break;
         case "text":
-          state.text[a.el] = a.text;
+          if (el) state.text[el] = a.text;
           break;
+        case "copy": {
+          const from = target(a.from);
+          if (el && from) state.text[el] = textOf(def, state, from);
+          break;
+        }
         case "image":
-          state.img[a.el] = a.asset;
+          if (el) state.img[el] = a.asset;
           break;
         case "color":
-          state.color[a.el] = a.color;
+          if (el) state.color[el] = a.color;
           break;
         case "move":
-          state.pos[a.el] = { x: a.x, y: a.y };
+          if (el) state.pos[el] = { x: a.x, y: a.y };
           break;
         case "add":
         case "set": {
+          if (!el) break;
           const before = { ...state.num };
-          state.num[a.el] = a.a === "add" ? (state.num[a.el] || 0) + a.n : a.n;
+          state.num[el] = a.a === "add" ? (state.num[el] || 0) + a.n : a.n;
           // "when counter reaches N" rules fire when the condition becomes true.
-          for (const rule of def.rules) {
-            if (rule.when.on !== "count" || rule.when.el !== a.el) continue;
+          def.rules.forEach((rule, index) => {
+            if (rule.when.on !== "count" || rule.when.el !== el) return;
             const was = countMatches(rule, { num: before });
-            if (!was && countMatches(rule, state)) run(def, state, rule.do, now, fired, budget);
-          }
+            if (!was && countMatches(rule, state) && condsMet(def, state, rule, ctx)) {
+              run(def, state, rule.do, now, fired, budget, { ...ctx, rule: index });
+            }
+          });
           break;
         }
         case "start": {
@@ -191,10 +257,32 @@
         case "sound":
           fired.push(a);
           break;
+        case "wait":
+          // Pause here until the right thing is pressed.
+          if (state.waits.length < 50) {
+            state.waits.push({ el: a.el, blank: a.blank, rest: actions.slice(i + 1), rule: ctx.rule ?? null, pressed: ctx.pressed || null });
+          }
+          return;
+        case "delay":
+          if (state.waits.length < 50) {
+            state.waits.push({ until: now + a.secs * 1000, rest: actions.slice(i + 1), rule: ctx.rule ?? null, pressed: ctx.pressed || null });
+          }
+          return;
+        case "halt":
+          // Stop everything that's waiting (e.g. the game is over).
+          state.waits = [];
+          return;
+        case "loop": {
+          // Start this rule's steps over (use a wait or delay so it doesn't spin).
+          const rule = def.rules[ctx.rule];
+          if (rule && budget.left > 0) run(def, state, rule.do, now, fired, budget, ctx);
+          return;
+        }
         case "reset": {
           const fresh = baseState(def);
           Object.assign(state, fresh, { seq: state.seq });
-          break;
+          runStart(def, state, now, fired, budget);
+          return;
         }
         default:
           break;
@@ -202,49 +290,88 @@
     }
   }
 
+  function runStart(def, state, now, fired, budget) {
+    def.rules.forEach((rule, index) => {
+      if (rule.when.on === "start" && condsMet(def, state, rule, {})) {
+        run(def, state, rule.do, now, fired, budget, { rule: index });
+      }
+    });
+  }
+
   function initialState(def, now = Date.now()) {
     const state = baseState(def);
-    const fired = [];
-    const budget = { left: 200 };
-    for (const rule of def.rules) {
-      if (rule.when.on === "start") run(def, state, rule.do, now, fired, budget);
-    }
+    runStart(def, state, now, [], { left: 400 });
     return state;
   }
 
-  // event: { type: "press", el } or { type: "tick" } (finish expired timers)
+  // event: { type: "press", el } or { type: "tick" } (finish timers/delays)
   function apply(def, prevState, event, now = Date.now()) {
     const state = JSON.parse(JSON.stringify(prevState || initialState(def, now)));
+    if (!Array.isArray(state.waits)) state.waits = [];
     const fired = [];
-    const budget = { left: 200 };
+    const budget = { left: 400 };
     let changed = false;
     if (event?.type === "press") {
       const el = def.elements.find((item) => item.id === event.el);
       if (el && state.vis[el.id] !== false) {
-        for (const rule of def.rules) {
-          if (rule.when.on === "press" && rule.when.el === el.id) {
-            run(def, state, rule.do, now, fired, budget);
+        const ctx = { pressed: el.id };
+        // Anything that was waiting for this press carries on.
+        const ready = state.waits.filter(
+          (w) => w.el && (w.el === el.id || w.el === "*") && (!w.blank || !textOf(def, state, el.id))
+        );
+        if (ready.length) {
+          state.waits = state.waits.filter((w) => !ready.includes(w));
+          for (const w of ready) run(def, state, w.rest, now, fired, budget, { pressed: el.id, rule: w.rule });
+          changed = true;
+        }
+        def.rules.forEach((rule, index) => {
+          if (rule.when.on === "press" && rule.when.el === el.id && condsMet(def, state, rule, ctx)) {
+            run(def, state, rule.do, now, fired, budget, { ...ctx, rule: index });
             changed = true;
           }
-        }
+        });
+        // "After any press" rules (good for checking who won).
+        def.rules.forEach((rule, index) => {
+          if (rule.when.on === "after" && condsMet(def, state, rule, ctx)) {
+            run(def, state, rule.do, now, fired, budget, { ...ctx, rule: index });
+            changed = true;
+          }
+        });
       }
     }
-    // Timers that are done (a press may also have run for a while).
+    // Timers and delays that are done.
     for (let guard = 0; guard < 20; guard += 1) {
       const due = Object.entries(state.timers).filter(([, end]) => end && end <= now);
-      if (!due.length) break;
+      const delays = state.waits.filter((w) => w.until && w.until <= now);
+      if (!due.length && !delays.length) break;
       for (const [id] of due) {
         state.timers[id] = null;
         changed = true;
-        for (const rule of def.rules) {
-          if (rule.when.on === "timer" && rule.when.timer === id) run(def, state, rule.do, now, fired, budget);
-        }
+        def.rules.forEach((rule, index) => {
+          if (rule.when.on === "timer" && rule.when.timer === id && condsMet(def, state, rule, {})) {
+            run(def, state, rule.do, now, fired, budget, { rule: index });
+          }
+        });
+      }
+      if (delays.length) {
+        state.waits = state.waits.filter((w) => !delays.includes(w));
+        for (const w of delays) run(def, state, w.rest, now, fired, budget, { pressed: w.pressed, rule: w.rule });
+        changed = true;
       }
     }
     if (changed) state.seq = (state.seq || 0) + 1;
     return { state, fired, changed };
   }
 
-  const api = { sanitize, initialState, apply, assetsOf, TYPES, ASPECTS, SHAPES, SCREEN_KINDS };
+  // Next moment something time-based happens (for clients to send a tick).
+  function nextDue(state) {
+    const times = [
+      ...Object.values(state?.timers || {}).filter(Boolean),
+      ...(state?.waits || []).map((w) => w.until).filter(Boolean),
+    ];
+    return times.length ? Math.min(...times) : null;
+  }
+
+  const api = { sanitize, initialState, apply, nextDue, assetsOf, TYPES, ASPECTS, SHAPES, SCREEN_KINDS };
   root.CrumbsEngine = api;
 })(typeof globalThis !== "undefined" ? globalThis : window);

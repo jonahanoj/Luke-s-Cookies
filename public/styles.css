@@ -3373,3 +3373,24 @@ html.scr-shake {
     width: min(320px, 74vw);
   }
 }
+
+.cb-template {
+  border-color: var(--accent) !important;
+  font-weight: 700;
+}
+
+.cb-cond {
+  padding-left: 12px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.cb-if-add {
+  font-size: 12px !important;
+  padding: 2px 8px !important;
+}
+
+.cb-action .cb-field {
+  flex-direction: row;
+  align-items: center;
+}

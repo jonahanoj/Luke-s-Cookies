@@ -188,11 +188,11 @@ const Crumbs = (() => {
     for (const [id, entry] of live) {
       const alive = [...entry.cards].some((card) => card.isConnected);
       if (!alive) continue;
-      const running = Object.values(entry.state?.timers || {}).filter(Boolean);
-      if (!running.length) continue;
-      redrawEntry(id);
+      const due = E.nextDue(entry.state);
+      if (!due) continue;
+      if (Object.values(entry.state?.timers || {}).some(Boolean)) redrawEntry(id);
       const now = Date.now() + entry.offset;
-      if (running.some((end) => end <= now) && Date.now() - entry.tickSent > 1500) {
+      if (due <= now && Date.now() - entry.tickSent > 1500) {
         entry.tickSent = Date.now();
         send(id, { type: "tick" });
       }
@@ -323,8 +323,84 @@ const Crumbs = (() => {
     paintStage();
   }
 
+  // Ready-made example: tic-tac-toe that takes turns X, O, X, O…
+  function ticTacToe() {
+    const els = [
+      { id: "status", type: "text", x: 5, y: 3, w: 90, h: 9, text: "X's turn", size: 22, textColor: "#1b1b1b", shape: "rounded" },
+    ];
+    for (let r = 0; r < 3; r += 1) {
+      for (let c = 0; c < 3; c += 1) {
+        els.push({
+          id: `sq${r * 3 + c}`,
+          type: "button",
+          x: 11 + c * 27,
+          y: 14 + r * 21,
+          w: 25,
+          h: 19,
+          text: "",
+          color: "#ffffff",
+          textColor: "#1b1b1b",
+          size: 44,
+          shape: "rounded",
+        });
+      }
+    }
+    els.push({ id: "again", type: "button", x: 30, y: 84, w: 40, h: 10, text: "New game", color: "#4d9dff", textColor: "#ffffff", size: 16, shape: "pill" });
+    const rules = [
+      {
+        when: { on: "start" },
+        do: [
+          { a: "text", el: "status", text: "X's turn" },
+          { a: "wait", el: "*", blank: true },
+          { a: "text", el: "@pressed", text: "X" },
+          { a: "color", el: "@pressed", color: "#ffd6e0" },
+          { a: "text", el: "status", text: "O's turn" },
+          { a: "wait", el: "*", blank: true },
+          { a: "text", el: "@pressed", text: "O" },
+          { a: "color", el: "@pressed", color: "#d6e8ff" },
+          { a: "loop" },
+        ],
+      },
+      {
+        when: { on: "after" },
+        if: [...Array(9)].map((_, i) => ({ k: "text", el: `sq${i}`, op: "!=", v: "" })),
+        do: [{ a: "text", el: "status", text: "It's a draw!" }, { a: "halt" }],
+      },
+    ];
+    const lines = [
+      [0, 1, 2], [3, 4, 5], [6, 7, 8],
+      [0, 3, 6], [1, 4, 7], [2, 5, 8],
+      [0, 4, 8], [2, 4, 6],
+    ];
+    for (const player of ["X", "O"]) {
+      for (const line of lines) {
+        rules.push({
+          when: { on: "after" },
+          if: line.map((i) => ({ k: "text", el: `sq${i}`, op: "==", v: player })),
+          do: [
+            { a: "text", el: "status", text: `${player} wins! 🎉` },
+            { a: "halt" },
+            { a: "screen", kind: "shake", secs: 1 },
+          ],
+        });
+      }
+    }
+    rules.push({ when: { on: "press", el: "again" }, do: [{ a: "reset" }] });
+    def = { title: "Tic-tac-toe", aspect: "tall", bg: "#fff7ec", elements: els, timers: [], rules };
+    $("cb-title").value = def.title;
+    $("cb-aspect").value = def.aspect;
+    $("cb-bg").value = def.bg;
+    selected = null;
+    paintStage();
+  }
+
   dialog.querySelector(".cb-add").addEventListener("click", (event) => {
     const type = event.target.closest("[data-add]")?.dataset.add;
+    if (event.target.closest("[data-template]")) {
+      if (def.elements.length && !confirm("Replace what you've built with the tic-tac-toe example?")) return;
+      ticTacToe();
+      return;
+    }
     if (!type) return;
     if (type === "image") pickImage((key) => addElement("image", key));
     else addElement(type);
@@ -558,6 +634,8 @@ const Crumbs = (() => {
 
   // ---------- rules ----------
   const elName = (id) => {
+    if (id === "@pressed") return "the pressed one";
+    if (id === "*") return "anything";
     const el = def.elements.find((item) => item.id === id);
     if (!el) return id;
     const text = (el.text || "").trim();
@@ -607,6 +685,7 @@ const Crumbs = (() => {
       opts.push([`count:${el.id}`, `${elName(el.id)} reaches a number`]);
     }
     opts.push(["start", "the crumb is sent"]);
+    opts.push(["after", "anything is pressed (checked after)"]);
     return opts;
   }
 
@@ -624,12 +703,15 @@ const Crumbs = (() => {
           ? `timer:${rule.when.timer}`
           : rule.when.on === "count"
             ? `count:${rule.when.el}`
-            : "start";
+            : rule.when.on === "after"
+              ? "after"
+              : "start";
     const trig = selectEl(triggerOptions(), key, (v) => {
       const [on, id] = v.split(":");
       if (on === "press") rule.when = { on, el: id };
       else if (on === "timer") rule.when = { on, timer: id };
       else if (on === "count") rule.when = { on, el: id, cmp: ">=", n: 10 };
+      else if (on === "after") rule.when = { on: "after" };
       else rule.when = { on: "start" };
       paintRules();
     });
@@ -659,6 +741,17 @@ const Crumbs = (() => {
     });
     whenRow.append(del);
     card.append(whenRow);
+    (rule.if || []).forEach((cond, i) => card.append(condRow(rule, cond, i)));
+    const addIf = document.createElement("button");
+    addIf.type = "button";
+    addIf.className = "btn ghost small cb-if-add";
+    addIf.textContent = "+ only if…";
+    addIf.addEventListener("click", () => {
+      rule.if = rule.if || [];
+      rule.if.push({ k: "text", el: def.elements[0]?.id, op: "==", v: "" });
+      paintRules();
+    });
+    card.append(addIf);
     rule.do.forEach((action, i) => card.append(actionRow(rule, action, i)));
     const add = document.createElement("button");
     add.type = "button";
@@ -671,6 +764,52 @@ const Crumbs = (() => {
     });
     card.append(add);
     return card;
+  }
+
+  const withPressed = () => [["@pressed", "the pressed one"], ...def.elements.map((e) => [e.id, elName(e.id)])];
+
+  const COND_KINDS = [
+    ["text:==", "text is"],
+    ["text:!=", "text isn't"],
+    ["num:>=", "counter ≥"],
+    ["num:<=", "counter ≤"],
+    ["num:==", "counter ="],
+    ["num:!=", "counter ≠"],
+    ["shown:==", "is shown"],
+    ["shown:!=", "is hidden"],
+  ];
+
+  function condRow(rule, cond, index) {
+    const row = document.createElement("div");
+    row.className = "cb-rule-row cb-cond";
+    const label = document.createElement("span");
+    label.textContent = index === 0 ? "only if" : "and";
+    row.append(
+      label,
+      selectEl(withPressed(), cond.el, (v) => (cond.el = v)),
+      selectEl(COND_KINDS, `${cond.k}:${cond.op}`, (v) => {
+        const [k, op] = v.split(":");
+        cond.k = k;
+        cond.op = op;
+        cond.v = k === "num" ? 0 : k === "text" ? "" : undefined;
+        paintRules();
+      })
+    );
+    if (cond.k === "text") {
+      row.append(inputEl("text", cond.v, (v) => (cond.v = v), { maxLength: 200, placeholder: "(empty)" }));
+    } else if (cond.k === "num") {
+      row.append(inputEl("number", cond.v, (v) => (cond.v = v), { className: "cb-num" }));
+    }
+    const x = document.createElement("button");
+    x.type = "button";
+    x.className = "bar-x";
+    x.textContent = "×";
+    x.addEventListener("click", () => {
+      rule.if.splice(index, 1);
+      paintRules();
+    });
+    row.append(x);
+    return row;
   }
 
   const ACTIONS = [
@@ -687,6 +826,11 @@ const Crumbs = (() => {
     ["stop", "stop timer"],
     ["screen", "screen effect"],
     ["sound", "play sound"],
+    ["wait", "wait until pressed"],
+    ["delay", "wait seconds"],
+    ["copy", "copy text"],
+    ["loop", "start these steps over"],
+    ["halt", "stop all waiting (end)"],
     ["reset", "reset everything"],
   ];
 
@@ -718,14 +862,47 @@ const Crumbs = (() => {
         fresh.kind = "shake";
         fresh.secs = 2;
       }
+      if (v === "wait") {
+        fresh.el = "*";
+        fresh.blank = false;
+      }
+      if (v === "delay") fresh.secs = 1;
+      if (v === "copy") {
+        fresh.from = first;
+        fresh.el = "@pressed";
+      }
       rule.do[index] = fresh;
       paintRules();
     });
     row.append(arrow, kind);
     const elOptions = def.elements.map((e) => [e.id, elName(e.id)]);
     if (["show", "hide", "toggle", "text", "color", "move", "image"].includes(action.a)) {
-      const opts = action.a === "image" ? elOptions.filter(([id]) => def.elements.find((e) => e.id === id)?.type === "image") : elOptions;
+      const opts =
+        action.a === "image"
+          ? [["@pressed", "the pressed one"], ...elOptions.filter(([id]) => def.elements.find((e) => e.id === id)?.type === "image")]
+          : withPressed();
       row.append(selectEl(opts, action.el, (v) => (action.el = v)));
+    }
+    if (action.a === "wait") {
+      row.append(
+        selectEl([["*", "anything"], ...elOptions], action.el, (v) => (action.el = v)),
+        field("only empty ones", inputEl("checkbox", action.blank, (v) => (action.blank = v)))
+      );
+    }
+    if (action.a === "delay") {
+      row.append(inputEl("number", action.secs, (v) => (action.secs = v), { className: "cb-num", min: 0.2, step: 0.5, title: "seconds" }));
+    }
+    if (action.a === "copy") {
+      const from = document.createElement("span");
+      from.textContent = "from";
+      const to = document.createElement("span");
+      to.textContent = "to";
+      row.append(
+        from,
+        selectEl(withPressed(), action.from, (v) => (action.from = v)),
+        to,
+        selectEl(withPressed(), action.el, (v) => (action.el = v))
+      );
     }
     if (action.a === "add" || action.a === "set") {
       row.append(
@@ -817,7 +994,7 @@ const Crumbs = (() => {
         testState = result.state;
         playFired(result.fired, localUrl);
       }
-      if (Object.values(testState.timers).some(Boolean) || result.changed) paint();
+      if (E.nextDue(testState) || result.changed) paint();
     }, 200);
   }
 
