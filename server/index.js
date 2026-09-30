@@ -254,6 +254,7 @@ function publicMessage(message, userId, blocked = null) {
     fxMime,
     edited: Boolean(message.edited_at),
     forwarded: Boolean(message.forwarded),
+    canStar: (message.origin_sender_id || message.sender_id) !== userId,
     reactions: groupReactions(message.reactions, userId),
     totalSize: all.reduce((sum, file) => sum + file.size, 0),
     reply: message.reply || null,
@@ -1514,6 +1515,11 @@ app.patch(
       removeFiles(fxFiles);
       return;
     }
+    if (message.forwarded && message.fx?.crumb) {
+      removeFiles(fxFiles);
+      res.status(400).json({ error: "Forwarded crumbs can't be edited." });
+      return;
+    }
     if (message.fx?.poll || message.fx?.roulette || message.fx?.theme || message.fx?.pack) {
       removeFiles(fxFiles);
       res.status(400).json({ error: "This kind of message can't be edited." });
@@ -1659,7 +1665,9 @@ app.post("/api/messages/:id/forward", requireUser, async (req, res) => {
       delete fx.roulette;
     }
     if (fx && !Object.keys(fx).length) fx = null;
-    const copy = await addMessage(conversation.id, req.user.id, message.body || "", attachments, fx, true);
+    const copy = await addMessage(conversation.id, req.user.id, message.body || "", attachments, fx, true, {
+      originSenderId: message.origin_sender_id || message.sender_id,
+    });
     if (fx?.crumb) {
       copy.crumb_state = globalThis.CrumbsEngine.initialState(fx.crumb);
       await setCrumbState(copy.id, copy.crumb_state);
@@ -1774,7 +1782,9 @@ app.post("/api/messages/:id/stars", requireUser, async (req, res) => {
   const { message, conversation } = await memberMessage(req, res);
   if (!message) return;
   const stars = Math.round(Number(req.body.stars));
-  if (message.sender_id === req.user.id) {
+  // Forwarded copies credit whoever wrote the original.
+  const receiverId = message.origin_sender_id || message.sender_id;
+  if (receiverId === req.user.id) {
     res.status(400).json({ error: "You can't star your own message." });
     return;
   }
@@ -1792,10 +1802,10 @@ app.post("/api/messages/:id/stars", requireUser, async (req, res) => {
     res.status(400).json({ error: `You only have ${Math.max(0, remaining)} stars left today.` });
     return;
   }
-  await giveStars(message.id, req.user.id, message.sender_id, stars, day);
+  await giveStars(message.id, req.user.id, receiverId, stars, day);
   const updated = await getMessage(message.id);
   await emitMessageUpdated(conversation, updated);
-  io.to(message.sender_id).emit("stars-received", { stars, from: req.user.username });
+  io.to(receiverId).emit("stars-received", { stars, from: req.user.username });
   res.json({ message: publicMessage(updated, req.user.id), remaining: remaining - stars });
 });
 

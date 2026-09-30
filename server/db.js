@@ -140,6 +140,7 @@ function mapPgMessage(row) {
     stars: jsonList(row.stars),
     crumb_state: row.crumb_state ? parseFx(row.crumb_state) : null,
     reply_to: row.reply_to || null,
+    origin_sender_id: row.origin_sender_id || null,
     scheduled_for: row.scheduled_for || null,
   };
 }
@@ -314,6 +315,7 @@ export async function initDb() {
       );
       CREATE INDEX IF NOT EXISTS reactions_message ON reactions (message_id);
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to TEXT;
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS origin_sender_id TEXT;
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS scheduled_for TIMESTAMPTZ;
       CREATE TABLE IF NOT EXISTS poll_votes (
         message_id TEXT NOT NULL,
@@ -719,6 +721,7 @@ export async function listConversations(userId) {
 // Extra per-message data (reactions, poll votes, views, stars, crumb state).
 const EXTRA_COLS = `
   m.reply_to,
+  m.origin_sender_id,
   m.scheduled_for,
   (SELECT COALESCE(json_agg(json_build_object('k', r.rkey, 'u', r.user_id, 'n', ru.username) ORDER BY r.created_at), '[]')
      FROM reactions r LEFT JOIN users ru ON ru.id = r.user_id WHERE r.message_id = m.id) AS reactions,
@@ -745,6 +748,7 @@ function fileExtras(message) {
   const name = (id) => fileStore.users.find((user) => user.id === id)?.username || null;
   return {
     reply_to: message.reply_to || null,
+    origin_sender_id: message.origin_sender_id || null,
     scheduled_for: message.scheduled_for || null,
     reactions: fileReactions(message.id),
     votes: fileStore.poll_votes
@@ -835,6 +839,7 @@ export async function addMessage(
   options = {}
 ) {
   const replyTo = options.replyTo || null;
+  const originSenderId = options.originSenderId || null;
   const scheduledFor = options.scheduledFor || null;
   const id = randomUUID();
   const createdAt = new Date().toISOString();
@@ -847,8 +852,8 @@ export async function addMessage(
   }));
   if (pool) {
     await pgQuery(
-      `INSERT INTO messages (id, conversation_id, sender_id, body, pinned, fx, forwarded, reply_to, scheduled_for)
-       VALUES ($1, $2, $3, $4, FALSE, $5, $6, $7, $8)`,
+      `INSERT INTO messages (id, conversation_id, sender_id, body, pinned, fx, forwarded, reply_to, scheduled_for, origin_sender_id)
+       VALUES ($1, $2, $3, $4, FALSE, $5, $6, $7, $8, $9)`,
       [
         id,
         conversationId,
@@ -858,6 +863,7 @@ export async function addMessage(
         Boolean(forwarded),
         replyTo,
         scheduledFor,
+        originSenderId,
       ]
     );
     for (const file of files) {
@@ -882,6 +888,7 @@ export async function addMessage(
       fx,
       forwarded: Boolean(forwarded),
       reply_to: replyTo,
+      origin_sender_id: originSenderId,
       scheduled_for: scheduledFor,
       reactions: [],
       votes: [],
@@ -902,6 +909,7 @@ export async function addMessage(
     fx,
     forwarded: Boolean(forwarded),
     reply_to: replyTo,
+    origin_sender_id: originSenderId,
     scheduled_for: scheduledFor,
   };
   fileStore.messages.push(message);

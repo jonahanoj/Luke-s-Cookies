@@ -84,11 +84,45 @@ const Crumbs = (() => {
     }
   }
 
-  function playFired(fired, assetUrl) {
+  // ---------- per-crumb mute (remembered on this device) ----------
+  const MUTE_KEY = "lc-muted-crumbs";
+  let mutedIds = new Set();
+  try {
+    mutedIds = new Set(JSON.parse(localStorage.getItem(MUTE_KEY) || "[]"));
+  } catch {}
+  const playing = new Map(); // messageId -> Set<Audio>
+
+  function isMuted(id) {
+    return Boolean(id) && mutedIds.has(id);
+  }
+
+  function setMuted(id, muted) {
+    if (muted) mutedIds.add(id);
+    else mutedIds.delete(id);
+    try {
+      localStorage.setItem(MUTE_KEY, JSON.stringify([...mutedIds].slice(-500)));
+    } catch {}
+    if (muted) {
+      for (const audio of playing.get(id) || []) audio.pause();
+      playing.delete(id);
+    }
+  }
+
+  function hasSound(def) {
+    return JSON.stringify(def || {}).includes('"a":"sound"');
+  }
+
+  function playFired(fired, assetUrl, id = null) {
     for (const f of fired || []) {
       if (f.a === "screen") Fx.screenPulse(f.kind, f.secs);
       else if (f.a === "sound") {
+        if (isMuted(id)) continue;
         const audio = new Audio(assetUrl(f.asset));
+        if (id) {
+          if (!playing.has(id)) playing.set(id, new Set());
+          playing.get(id).add(audio);
+          audio.addEventListener("ended", () => playing.get(id)?.delete(audio));
+        }
         audio.play().catch(() => {});
       }
     }
@@ -154,10 +188,10 @@ const Crumbs = (() => {
     if (payload.serverNow) entry.offset = payload.serverNow - Date.now();
     redrawEntry(payload.messageId);
     // Everyone gets the screen effects/sounds once (the socket event), not twice.
-    if (changed && !fromMe) playFired(payload.fired, serverUrl);
+    if (changed && !fromMe) playFired(payload.fired, serverUrl, payload.messageId);
     else if (changed && fromMe) {
       entry.lastFiredSeq = payload.state.seq;
-      playFired(payload.fired, serverUrl);
+      playFired(payload.fired, serverUrl, payload.messageId);
     }
   }
 
@@ -172,11 +206,33 @@ const Crumbs = (() => {
     const wrap = document.createElement("div");
     wrap.className = "crumb-wrap";
     const def = message.fx.crumb;
-    if (def.title) {
+    const sound = hasSound(def);
+    if (def.title || sound) {
+      const head = document.createElement("div");
+      head.className = "crumb-head";
       const title = document.createElement("div");
       title.className = "crumb-title";
-      title.textContent = `🍪 ${def.title}`;
-      wrap.append(title);
+      title.textContent = def.title ? `🍪 ${def.title}` : "";
+      head.append(title);
+      if (sound) {
+        const mute = document.createElement("button");
+        mute.type = "button";
+        mute.className = "crumb-mute";
+        const paint = () => {
+          const muted = isMuted(message.id);
+          mute.textContent = muted ? "🔇" : "🔊";
+          mute.title = muted ? "Unmute this crumb" : "Mute this crumb";
+          mute.setAttribute("aria-pressed", String(muted));
+        };
+        paint();
+        mute.addEventListener("click", (event) => {
+          event.stopPropagation();
+          setMuted(message.id, !isMuted(message.id));
+          paint();
+        });
+        head.append(mute);
+      }
+      wrap.append(head);
     }
     const card = document.createElement("div");
     card.className = "crumb-card";
@@ -365,7 +421,9 @@ const Crumbs = (() => {
     else addElement(type);
   });
 
-  function paintStage() {
+  // stageOnly: redraw the card but leave the settings panel alone (so a
+  // color picker or slider that's open doesn't get closed).
+  function paintStage(stageOnly = false) {
     if (!def) return;
     const state = E.initialState(sanitizedPreview() || { elements: [], timers: [], rules: [] });
     // Show everything while building (hidden ones are faded).
@@ -377,7 +435,7 @@ const Crumbs = (() => {
       selectedId: selected,
       onSelect: startDrag,
     });
-    paintProps();
+    if (!stageOnly) paintProps();
   }
 
   // A crumb definition we can run locally (asset keys pass straight through).
@@ -478,6 +536,7 @@ const Crumbs = (() => {
       return;
     }
     const redrawSoon = () => paintStage();
+    const redrawCard = () => paintStage(true);
     const head = document.createElement("div");
     head.className = "cb-props-head";
     head.textContent = `${LABELS[el.type]} · ${el.id}`;
@@ -512,18 +571,18 @@ const Crumbs = (() => {
       grid.append(
         field("Color", inputEl("color", el.color || "#ffffff", (v) => {
           el.color = v;
-          redrawSoon();
+          redrawCard();
         }))
       );
       grid.append(
         field("Text color", inputEl("color", el.textColor || "#1b1b1b", (v) => {
           el.textColor = v;
-          redrawSoon();
+          redrawCard();
         }))
       );
       const size = inputEl("range", el.size, (v) => {
         el.size = v;
-        redrawSoon();
+        redrawCard();
       }, { min: 8, max: 72 });
       grid.append(field("Text size", size));
       grid.append(

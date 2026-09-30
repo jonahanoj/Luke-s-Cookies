@@ -153,6 +153,18 @@ textarea {
   font-size: 16px;
 }
 
+/* Sliders: no text-box padding (so the ends are reachable) and no page
+   panning while dragging one on a touch screen. */
+input[type="range"] {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  min-height: 28px;
+  touch-action: none;
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+
 textarea {
   resize: vertical;
   min-height: 80px;
@@ -2390,8 +2402,10 @@ button.picker-pack:hover {
 .pop-menu {
   position: fixed;
   z-index: 75;
-  min-width: 200px;
+  min-width: min(200px, calc(100vw - 16px));
   max-width: calc(100vw - 16px);
+  max-height: calc(100dvh - 16px);
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
   background: var(--paper-solid);
@@ -2425,13 +2439,16 @@ button.picker-pack:hover {
 
 .star-row {
   display: flex;
+  flex-wrap: wrap;
   gap: 2px;
 }
 
 .star-row .star {
   border: 0;
   background: transparent;
-  font-size: 24px;
+  font-size: clamp(20px, 7vw, 24px);
+  min-width: 28px;
+  min-height: 32px;
   color: var(--line);
   cursor: pointer;
   padding: 0 1px;
@@ -3000,10 +3017,34 @@ html.scr-shake {
   width: min(320px, 72vw);
 }
 
+.crumb-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
 .crumb-title {
+  flex: 1;
+  min-width: 0;
   font-weight: 700;
   font-size: 13px;
-  margin-bottom: 4px;
+  overflow-wrap: anywhere;
+}
+
+.crumb-mute {
+  flex: none;
+  border: 1px solid var(--line);
+  background: var(--paper-solid);
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1;
+  padding: 4px 7px;
+  cursor: pointer;
+}
+
+.crumb-mute[aria-pressed="true"] {
+  opacity: 0.7;
 }
 
 .crumb-card {

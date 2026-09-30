@@ -9,20 +9,39 @@ const Extras = (() => {
   function closeMenus() {
     for (const id of ["plus-menu", "msg-menu", "star-pop"]) $(id).hidden = true;
     openMenuEl = null;
+    menuWatcher?.disconnect();
+  }
+
+  // Keeps a popup fully on screen, and re-checks whenever its size changes
+  // (e.g. the star row fills in after "Loading…").
+  let menuAnchor = null;
+  const menuWatcher = typeof ResizeObserver === "function" ? new ResizeObserver(() => placeMenu()) : null;
+
+  function placeMenu() {
+    const menu = openMenuEl;
+    if (!menu || menu.hidden || !menuAnchor) return;
+    const vw = document.documentElement.clientWidth || window.innerWidth;
+    const vh = window.visualViewport?.height || window.innerHeight;
+    const box = menuAnchor.getBoundingClientRect();
+    const width = Math.min(menu.offsetWidth || 240, vw - 16);
+    const height = Math.min(menu.offsetHeight || 200, vh - 16);
+    const left = Math.max(8, Math.min(box.left, vw - width - 8));
+    let top;
+    if (box.bottom + 6 + height <= vh - 8) top = box.bottom + 6;
+    else if (box.top - height - 6 >= 8) top = box.top - height - 6;
+    else top = vh - height - 8;
+    menu.style.left = `${left}px`;
+    menu.style.top = `${Math.max(8, top)}px`;
   }
 
   function showMenu(menu, anchor) {
     closeMenus();
     menu.hidden = false;
     openMenuEl = menu;
-    const box = anchor.getBoundingClientRect();
-    const width = Math.min(menu.offsetWidth || 240, window.innerWidth - 16);
-    const height = menu.offsetHeight || 200;
-    let left = Math.min(box.left, window.innerWidth - width - 8);
-    left = Math.max(8, left);
-    const below = box.bottom + 6 + height < window.innerHeight;
-    menu.style.left = `${left}px`;
-    menu.style.top = `${below ? box.bottom + 6 : Math.max(8, box.top - height - 6)}px`;
+    menuAnchor = anchor;
+    placeMenu();
+    menuWatcher?.disconnect();
+    menuWatcher?.observe(menu);
   }
 
   document.addEventListener("mousedown", (event) => {
@@ -30,7 +49,8 @@ const Extras = (() => {
     if (event.target.closest(".pop-menu, #plus-btn, .more-btn")) return;
     closeMenus();
   });
-  window.addEventListener("resize", closeMenus);
+  window.addEventListener("resize", () => placeMenu());
+  window.visualViewport?.addEventListener("resize", () => placeMenu());
 
   // ---------- send options: reply + schedule ----------
   let replyTo = null;
@@ -163,13 +183,13 @@ const Extras = (() => {
     if (message.scheduledFor) {
       item("Cancel scheduled message", () => deleteMessage(message, true), true);
     } else if (!message.gone) {
-      if (!message.mine) item("★ Rate with stars", () => openStars(anchor, message));
+      if (message.canStar ?? !message.mine) item("★ Rate with stars", () => openStars(anchor, message));
       item("↪ Forward", () => openForward(message));
       const tooBig = (message.totalSize || 0) > MAX_PIN_BYTES;
       if (message.pinned) item("📌 Unpin", () => pinMessage(message, false));
       else if (!tooBig) item("📌 Pin (keep past the wipe)", () => pinMessage(message, true));
       if (message.mine && !special) item("✏️ Edit", () => Fx.openEditForMessage(message));
-      if (message.mine && message.fx?.crumb) item("✏️ Edit crumb", () => Crumbs.openEdit(message));
+      if (message.mine && !message.forwarded && message.fx?.crumb) item("✏️ Edit crumb", () => Crumbs.openEdit(message));
       if (message.mine) item("🗑 Delete", () => deleteMessage(message, false), true);
     } else if (message.mine) {
       item("🗑 Remove", () => deleteMessage(message, false), true);

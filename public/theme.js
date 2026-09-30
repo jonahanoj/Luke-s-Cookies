@@ -360,3 +360,64 @@
 
   applyCached();
 })();
+
+// Touch sliding for every <input type="range">: press anywhere on the slider
+// and drag, and the value follows your finger all the way to both ends.
+// (Some phones only jump on tap, or treat the drag as scrolling.)
+(function () {
+  function valueAt(input, clientX) {
+    const box = input.getBoundingClientRect();
+    const min = Number(input.min || 0);
+    const max = Number(input.max === "" ? 100 : input.max);
+    const thumb = Math.min(24, box.width / 4);
+    let t = (clientX - box.left - thumb / 2) / Math.max(1, box.width - thumb);
+    t = Math.max(0, Math.min(1, t));
+    const stepAttr = input.step;
+    let v = min + t * (max - min);
+    if (stepAttr !== "any") {
+      const step = Number(stepAttr) || 1;
+      v = min + Math.round((v - min) / step) * step;
+      const decimals = (String(step).split(".")[1] || "").length;
+      v = Number(v.toFixed(decimals));
+    }
+    return Math.max(min, Math.min(max, v));
+  }
+
+  function setValue(input, clientX) {
+    const next = String(valueAt(input, clientX));
+    if (input.value === next) return false;
+    input.value = next;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    return true;
+  }
+
+  document.addEventListener(
+    "pointerdown",
+    (event) => {
+      const input = event.target;
+      if (!(input instanceof HTMLInputElement) || input.type !== "range" || input.disabled) return;
+      if (event.pointerType === "mouse") return; // mice already slide fine
+      event.preventDefault();
+      let changed = setValue(input, event.clientX);
+      try {
+        input.setPointerCapture(event.pointerId);
+      } catch {}
+      const move = (ev) => {
+        if (ev.pointerId !== event.pointerId) return;
+        ev.preventDefault();
+        if (setValue(input, ev.clientX)) changed = true;
+      };
+      const end = (ev) => {
+        if (ev.pointerId !== event.pointerId) return;
+        input.removeEventListener("pointermove", move);
+        input.removeEventListener("pointerup", end);
+        input.removeEventListener("pointercancel", end);
+        if (changed) input.dispatchEvent(new Event("change", { bubbles: true }));
+      };
+      input.addEventListener("pointermove", move);
+      input.addEventListener("pointerup", end);
+      input.addEventListener("pointercancel", end);
+    },
+    { capture: true, passive: false }
+  );
+})();
