@@ -332,6 +332,7 @@ function connectSocket() {
   });
   socket.on("conversation-updated", (payload) => Groups.onConversationUpdated(payload.conversationId));
   socket.on("tasks-changed", (payload) => Groups.onTasksChanged(payload.conversationId));
+  socket.on("emojis-changed", () => Fx.onEmojisChanged());
   socket.on("message-updated", (payload) => {
     refreshPinned();
     if (payload.conversationId !== activeId) return;
@@ -699,6 +700,30 @@ function upsertMessage(message, replace = false) {
   }
 
   if (!message.blocked) {
+    const react = document.createElement("button");
+    react.type = "button";
+    react.className = "pin-btn react-btn";
+    react.textContent = "React";
+    react.addEventListener("click", (event) => {
+      event.stopPropagation();
+      openReactionPicker(event.currentTarget, message);
+    });
+    top.append(react);
+  }
+
+  if (!message.blocked) {
+    const fwd = document.createElement("button");
+    fwd.type = "button";
+    fwd.className = "pin-btn";
+    fwd.textContent = "Forward";
+    fwd.addEventListener("click", (event) => {
+      event.stopPropagation();
+      openForward(message);
+    });
+    top.append(fwd);
+  }
+
+  if (!message.blocked) {
     const pinBtn = document.createElement("button");
     pinBtn.type = "button";
     pinBtn.className = "pin-btn";
@@ -723,6 +748,13 @@ function upsertMessage(message, replace = false) {
   }
   bubble.append(top);
 
+  if (message.forwarded && !message.blocked) {
+    const tag = document.createElement("div");
+    tag.className = "forwarded-tag";
+    tag.textContent = "↪ Forwarded";
+    bubble.append(tag);
+  }
+
   if (message.blocked) {
     const text = document.createElement("div");
     text.textContent = "Message from someone you blocked";
@@ -741,6 +773,7 @@ function upsertMessage(message, replace = false) {
   if (message.fx?.pack && !message.blocked) bubble.append(Fx.renderPackCard(message.fx.pack));
   const files = renderAttachments(message);
   if (files) bubble.append(files);
+  if (!message.blocked && message.reactions?.length) bubble.append(renderReactions(message));
   const time = document.createElement("time");
   time.textContent = formatTime(message.createdAt) + (message.edited ? " · edited" : "");
   bubble.append(time);
@@ -1576,3 +1609,151 @@ registerServiceWorker();
   }
   showAuth();
 })();
+
+// ---------- forwarding ----------
+let forwarding = null;
+const forwardPicked = new Set();
+
+function renderForwardList() {
+  const list = $("forward-list");
+  const q = $("forward-search").value.trim().toLowerCase();
+  list.replaceChildren();
+  const chats = conversations.filter(
+    (item) => !item.blocked && (!q || chatName(item).toLowerCase().includes(q))
+  );
+  if (!chats.length) {
+    const empty = document.createElement("p");
+    empty.textContent = "No chats found.";
+    list.append(empty);
+  }
+  for (const item of chats) {
+    const row = document.createElement("label");
+    row.className = "forward-row";
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = forwardPicked.has(item.id);
+    box.addEventListener("change", () => {
+      if (box.checked) forwardPicked.add(item.id);
+      else forwardPicked.delete(item.id);
+      paintForwardButton();
+    });
+    const avatar = document.createElement("img");
+    avatar.className = "list-avatar";
+    avatar.src = item.avatarUrl || "/assets/SmallLogo.png";
+    avatar.alt = "";
+    const name = document.createElement("span");
+    name.textContent = chatName(item) + (item.id === activeId ? " (this chat)" : "");
+    row.append(box, avatar, name);
+    list.append(row);
+  }
+}
+
+function paintForwardButton() {
+  const button = $("forward-send");
+  button.disabled = forwardPicked.size === 0;
+  button.textContent = forwardPicked.size > 1 ? `Forward to ${forwardPicked.size}` : "Forward";
+}
+
+function openForward(message) {
+  forwarding = message;
+  forwardPicked.clear();
+  $("forward-search").value = "";
+  showError($("forward-error"), "");
+  renderForwardList();
+  paintForwardButton();
+  $("forward-dialog").showModal();
+}
+
+$("forward-search").addEventListener("input", renderForwardList);
+
+$("forward-send").addEventListener("click", async () => {
+  if (!forwarding || !forwardPicked.size) return;
+  const button = $("forward-send");
+  button.disabled = true;
+  button.textContent = "Forwarding…";
+  try {
+    const data = await api(`/api/messages/${forwarding.id}/forward`, {
+      method: "POST",
+      body: { conversationIds: [...forwardPicked] },
+    });
+    if (data.skipped?.length && !data.sent.length) {
+      showError($("forward-error"), "Couldn't forward to those chats.");
+      paintForwardButton();
+      return;
+    }
+    $("forward-dialog").close();
+    refreshConversations();
+  } catch (err) {
+    showError($("forward-error"), err.message);
+    paintForwardButton();
+  }
+});
+
+// ---------- reactions ----------
+function reactionKey(pick) {
+  return pick.unicode ? `u:${pick.unicode}` : `c:${pick.fileId}:${pick.name}`;
+}
+
+async function sendReaction(message, key) {
+  try {
+    const updated = await api(`/api/messages/${message.id}/react`, { method: "POST", body: { key } });
+    upsertMessage(updated, true);
+  } catch (err) {
+    showError(composeError, err.message);
+  }
+}
+
+function openReactionPicker(anchor, message) {
+  const picker = $("emoji-picker");
+  if (!picker.hidden) {
+    Fx.closePicker();
+    return;
+  }
+  Fx.openPicker(
+    anchor,
+    (pick) => {
+      Fx.closePicker();
+      sendReaction(message, reactionKey(pick));
+    },
+    { quick: true }
+  );
+}
+
+function renderReactions(message) {
+  const row = document.createElement("div");
+  row.className = "reactions";
+  for (const r of message.reactions) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "reaction" + (r.mine ? " mine" : "");
+    chip.title = r.names.join(", ");
+    if (r.key.startsWith("u:")) {
+      const face = document.createElement("span");
+      face.className = "reaction-face";
+      face.textContent = r.key.slice(2);
+      chip.append(face);
+    } else {
+      const [, fileId, name] = r.key.split(":");
+      chip.append(Fx.emojiImg(fileId, name));
+    }
+    const count = document.createElement("span");
+    count.textContent = String(r.count);
+    chip.append(count);
+    chip.addEventListener("click", (event) => {
+      event.stopPropagation();
+      sendReaction(message, r.key);
+    });
+    row.append(chip);
+  }
+  const add = document.createElement("button");
+  add.type = "button";
+  add.className = "reaction react-add";
+  add.textContent = "+";
+  add.title = "Add a reaction";
+  add.addEventListener("click", (event) => {
+    event.stopPropagation();
+    openReactionPicker(event.currentTarget, message);
+  });
+  row.append(add);
+  return row;
+}

@@ -26,6 +26,8 @@ function emptyStore() {
     tasks: [],
     emoji_packs: [],
     emojis: [],
+    pack_subs: [],
+    reactions: [],
   };
 }
 
@@ -45,6 +47,8 @@ function migrateFileStore() {
   if (!Array.isArray(fileStore.tasks)) fileStore.tasks = [];
   if (!Array.isArray(fileStore.emoji_packs)) fileStore.emoji_packs = [];
   if (!Array.isArray(fileStore.emojis)) fileStore.emojis = [];
+  if (!Array.isArray(fileStore.pack_subs)) fileStore.pack_subs = [];
+  if (!Array.isArray(fileStore.reactions)) fileStore.reactions = [];
   for (const conversation of fileStore.conversations) {
     if (conversation.created_by === undefined) conversation.created_by = null;
     if (conversation.avatar_id === undefined) conversation.avatar_id = null;
@@ -120,7 +124,23 @@ function mapPgMessage(row) {
     fx: parseFx(row.fx),
     edited_at: row.edited_at || null,
     deleted: Boolean(row.deleted),
+    forwarded: Boolean(row.forwarded),
+    reactions: Array.isArray(row.reactions)
+      ? row.reactions
+      : typeof row.reactions === "string"
+        ? JSON.parse(row.reactions)
+        : [],
   };
+}
+
+function fileReactions(messageId) {
+  return fileStore.reactions
+    .filter((r) => r.message_id === messageId)
+    .map((r) => ({
+      k: r.rkey,
+      u: r.user_id,
+      n: fileStore.users.find((user) => user.id === r.user_id)?.username || null,
+    }));
 }
 
 function parseFx(value) {
@@ -239,6 +259,7 @@ export async function initDb() {
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS fx TEXT;
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ;
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS forwarded BOOLEAN NOT NULL DEFAULT FALSE;
       ALTER TABLE attachments ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'file';
       CREATE TABLE IF NOT EXISTS tasks (
         id TEXT PRIMARY KEY,
@@ -267,6 +288,20 @@ export async function initDb() {
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
       CREATE INDEX IF NOT EXISTS emojis_pack ON emojis (pack_id);
+      CREATE TABLE IF NOT EXISTS emoji_pack_users (
+        user_id TEXT NOT NULL,
+        pack_id TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (user_id, pack_id)
+      );
+      CREATE TABLE IF NOT EXISTS reactions (
+        message_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        rkey TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (message_id, user_id, rkey)
+      );
+      CREATE INDEX IF NOT EXISTS reactions_message ON reactions (message_id);
     `);
     await pool.query(`
       CREATE INDEX IF NOT EXISTS messages_conv_created
@@ -648,6 +683,15 @@ export async function listMessages(conversationId) {
          m.fx,
          m.edited_at,
          m.deleted,
+         m.forwarded,
+         (
+           SELECT COALESCE(
+             json_agg(json_build_object('k', r.rkey, 'u', r.user_id, 'n', ru.username) ORDER BY r.created_at),
+             '[]'
+           )
+           FROM reactions r LEFT JOIN users ru ON ru.id = r.user_id
+           WHERE r.message_id = m.id
+         ) AS reactions,
          u.avatar_id,
          u.username AS sender_username,
          u.name_color,
@@ -687,6 +731,8 @@ export async function listMessages(conversationId) {
         fx: message.fx || null,
         edited_at: message.edited_at || null,
         deleted: Boolean(message.deleted),
+        forwarded: Boolean(message.forwarded),
+        reactions: fileReactions(message.id),
       };
     });
 }
@@ -696,7 +742,8 @@ export async function addMessage(
   senderId,
   body,
   attachments = [],
-  fx = null
+  fx = null,
+  forwarded = false
 ) {
   const id = randomUUID();
   const createdAt = new Date().toISOString();
@@ -709,9 +756,9 @@ export async function addMessage(
   }));
   if (pool) {
     await pgQuery(
-      `INSERT INTO messages (id, conversation_id, sender_id, body, pinned, fx)
-       VALUES ($1, $2, $3, $4, FALSE, $5)`,
-      [id, conversationId, senderId, body, fx ? JSON.stringify(fx) : null]
+      `INSERT INTO messages (id, conversation_id, sender_id, body, pinned, fx, forwarded)
+       VALUES ($1, $2, $3, $4, FALSE, $5, $6)`,
+      [id, conversationId, senderId, body, fx ? JSON.stringify(fx) : null, Boolean(forwarded)]
     );
     for (const file of files) {
       await pgQuery(
@@ -733,6 +780,7 @@ export async function addMessage(
       sender_username: sender?.username || null,
       name_color: sender?.name_color || "#6e8070",
       fx,
+      forwarded: Boolean(forwarded),
     };
   }
   const sender = fileStore.users.find((user) => user.id === senderId);
@@ -745,6 +793,7 @@ export async function addMessage(
     pinned: false,
     attachments: files,
     fx,
+    forwarded: Boolean(forwarded),
   };
   fileStore.messages.push(message);
   saveFileStore();
@@ -759,7 +808,15 @@ export async function addMessage(
 export async function getMessage(messageId) {
   if (pool) {
     const rows = await pgQuery(
-      `SELECT m.id, m.conversation_id, m.sender_id, m.body, m.pinned, m.created_at, m.fx, m.edited_at, m.deleted,
+      `SELECT m.id, m.conversation_id, m.sender_id, m.body, m.pinned, m.created_at, m.fx, m.edited_at, m.deleted, m.forwarded,
+              (
+                SELECT COALESCE(
+                  json_agg(json_build_object('k', r.rkey, 'u', r.user_id, 'n', ru.username) ORDER BY r.created_at),
+                  '[]'
+                )
+                FROM reactions r LEFT JOIN users ru ON ru.id = r.user_id
+                WHERE r.message_id = m.id
+              ) AS reactions,
               u.avatar_id, u.username AS sender_username, u.name_color
        FROM messages m
        LEFT JOIN users u ON u.id = m.sender_id
@@ -782,6 +839,7 @@ export async function getMessage(messageId) {
     avatar_id: sender?.avatar_id || null,
     sender_username: sender?.username || null,
     name_color: sender?.name_color || "#6e8070",
+    reactions: fileReactions(message.id),
   };
 }
 
@@ -862,6 +920,9 @@ export async function wipeExpiredMessages(now = new Date()) {
          RETURNING a.id`
       );
       removedFiles = files.rows;
+      await client.query(
+        `DELETE FROM reactions r WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.id = r.message_id)`
+      );
       await client.query("COMMIT");
     } catch (err) {
       await client.query("ROLLBACK");
@@ -883,6 +944,8 @@ export async function wipeExpiredMessages(now = new Date()) {
     }
     if (removedMessages) {
       fileStore.messages = keep;
+      const alive = new Set(keep.map((message) => message.id));
+      fileStore.reactions = fileStore.reactions.filter((r) => alive.has(r.message_id));
       saveFileStore();
     }
   }
@@ -1522,8 +1585,9 @@ export async function deleteTask(taskId) {
 
 // ---- custom emojis ----
 
+// The user's own packs, then packs they added from other people.
 export async function listEmojiPacks(ownerId) {
-  const packs = pool
+  const owned = pool
     ? await pgQuery(
         `SELECT id, owner_id, name, created_at FROM emoji_packs WHERE owner_id = $1 ORDER BY created_at`,
         [ownerId]
@@ -1531,11 +1595,100 @@ export async function listEmojiPacks(ownerId) {
     : fileStore.emoji_packs
         .filter((pack) => pack.owner_id === ownerId)
         .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+  const added = pool
+    ? await pgQuery(
+        `SELECT p.id, p.owner_id, p.name, p.created_at, u.username AS owner_name
+         FROM emoji_pack_users s
+         JOIN emoji_packs p ON p.id = s.pack_id
+         LEFT JOIN users u ON u.id = p.owner_id
+         WHERE s.user_id = $1
+         ORDER BY s.created_at`,
+        [ownerId]
+      )
+    : fileStore.pack_subs
+        .filter((sub) => sub.user_id === ownerId)
+        .map((sub) => {
+          const pack = fileStore.emoji_packs.find((item) => item.id === sub.pack_id);
+          if (!pack) return null;
+          const owner = fileStore.users.find((user) => user.id === pack.owner_id);
+          return { ...pack, owner_name: owner?.username || null };
+        })
+        .filter(Boolean);
   const result = [];
-  for (const pack of packs) {
-    result.push({ ...pack, emojis: await listEmojisInPack(pack.id) });
+  for (const pack of owned) {
+    result.push({ ...pack, mine: true, emojis: await listEmojisInPack(pack.id) });
+  }
+  for (const pack of added) {
+    result.push({ ...pack, mine: false, emojis: await listEmojisInPack(pack.id) });
   }
   return result;
+}
+
+export async function packSubscriberIds(packId) {
+  if (pool) {
+    const rows = await pgQuery(`SELECT user_id FROM emoji_pack_users WHERE pack_id = $1`, [packId]);
+    return rows.map((row) => row.user_id);
+  }
+  return fileStore.pack_subs.filter((sub) => sub.pack_id === packId).map((sub) => sub.user_id);
+}
+
+export async function isSubscribed(packId, userId) {
+  return (await packSubscriberIds(packId)).includes(userId);
+}
+
+export async function subscribePack(packId, userId) {
+  if (pool) {
+    await pgQuery(
+      `INSERT INTO emoji_pack_users (user_id, pack_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+      [userId, packId]
+    );
+    return;
+  }
+  if (!fileStore.pack_subs.some((sub) => sub.user_id === userId && sub.pack_id === packId)) {
+    fileStore.pack_subs.push({ user_id: userId, pack_id: packId, created_at: new Date().toISOString() });
+    saveFileStore();
+  }
+}
+
+export async function unsubscribePack(packId, userId) {
+  if (pool) {
+    await pgQuery(`DELETE FROM emoji_pack_users WHERE user_id = $1 AND pack_id = $2`, [userId, packId]);
+    return;
+  }
+  fileStore.pack_subs = fileStore.pack_subs.filter(
+    (sub) => !(sub.user_id === userId && sub.pack_id === packId)
+  );
+  saveFileStore();
+}
+
+// Before packs were shared live, "Add to my emojis" made a copy. Turn those
+// copies back into links to the original so they follow the creator's edits.
+export async function migrateCopiedPacks() {
+  const packs = pool
+    ? await pgQuery(`SELECT id, owner_id, name, created_at FROM emoji_packs ORDER BY created_at`)
+    : [...fileStore.emoji_packs].sort((a, b) =>
+        String(a.created_at).localeCompare(String(b.created_at))
+      );
+  const signature = new Map();
+  for (const pack of packs) {
+    const files = (await listEmojisInPack(pack.id)).map((emoji) => emoji.file_id).sort();
+    signature.set(pack.id, files.join(","));
+  }
+  let moved = 0;
+  for (let i = 0; i < packs.length; i += 1) {
+    const copy = packs[i];
+    const sig = signature.get(copy.id);
+    if (!sig) continue;
+    const original = packs
+      .slice(0, i)
+      .find((p) => p.owner_id !== copy.owner_id && p.name === copy.name && signature.get(p.id) === sig);
+    if (!original) continue;
+    await subscribePack(original.id, copy.owner_id);
+    await deleteEmojiPack(copy.id);
+    signature.delete(copy.id);
+    moved += 1;
+  }
+  return moved;
 }
 
 export async function getEmojiPack(packId) {
@@ -1596,11 +1749,13 @@ export async function renameEmojiPack(packId, name) {
 // (in any pack, including copies other people made) points at them.
 export async function deleteEmojiPack(packId) {
   if (pool) {
+    await pgQuery(`DELETE FROM emoji_pack_users WHERE pack_id = $1`, [packId]);
     await pgQuery(`DELETE FROM emojis WHERE pack_id = $1`, [packId]);
     await pgQuery(`DELETE FROM emoji_packs WHERE id = $1`, [packId]);
     return;
   }
   fileStore.emojis = fileStore.emojis.filter((emoji) => emoji.pack_id !== packId);
+  fileStore.pack_subs = fileStore.pack_subs.filter((sub) => sub.pack_id !== packId);
   fileStore.emoji_packs = fileStore.emoji_packs.filter((pack) => pack.id !== packId);
   saveFileStore();
 }
@@ -1745,11 +1900,13 @@ export async function deleteMessageContent(messageId) {
       `UPDATE messages SET body = '', fx = NULL, pinned = FALSE, deleted = TRUE WHERE id = $1`,
       [messageId]
     );
+    await pgQuery(`DELETE FROM reactions WHERE message_id = $1`, [messageId]);
   } else {
     const message = fileStore.messages.find((item) => item.id === messageId);
     if (!message) return null;
     fileIds.push(...(message.attachments || []).map((file) => file.id));
     Object.assign(message, { body: "", fx: null, pinned: false, deleted: true, attachments: [] });
+    fileStore.reactions = fileStore.reactions.filter((r) => r.message_id !== messageId);
     saveFileStore();
   }
   for (const id of fileIds) {
@@ -1760,4 +1917,47 @@ export async function deleteMessageContent(messageId) {
     }
   }
   return getMessage(messageId);
+}
+
+// ---- reactions ----
+
+// Adds the reaction if this user hasn't used it on the message, else removes it.
+export async function toggleReaction(messageId, userId, rkey) {
+  if (pool) {
+    const removed = await pgQuery(
+      `DELETE FROM reactions WHERE message_id = $1 AND user_id = $2 AND rkey = $3 RETURNING rkey`,
+      [messageId, userId, rkey]
+    );
+    if (!removed.length) {
+      await pgQuery(
+        `INSERT INTO reactions (message_id, user_id, rkey) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+        [messageId, userId, rkey]
+      );
+    }
+    return;
+  }
+  const at = fileStore.reactions.findIndex(
+    (r) => r.message_id === messageId && r.user_id === userId && r.rkey === rkey
+  );
+  if (at >= 0) fileStore.reactions.splice(at, 1);
+  else {
+    fileStore.reactions.push({
+      message_id: messageId,
+      user_id: userId,
+      rkey,
+      created_at: new Date().toISOString(),
+    });
+  }
+  saveFileStore();
+}
+
+export async function countUserReactions(messageId, userId) {
+  if (pool) {
+    const rows = await pgQuery(
+      `SELECT COUNT(*)::int AS n FROM reactions WHERE message_id = $1 AND user_id = $2`,
+      [messageId, userId]
+    );
+    return rows[0]?.n || 0;
+  }
+  return fileStore.reactions.filter((r) => r.message_id === messageId && r.user_id === userId).length;
 }

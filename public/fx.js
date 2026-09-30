@@ -134,6 +134,15 @@ const Fx = (() => {
   }
 
   // ---------- rendering styled text ----------
+  // Movement / glow / rainbow on a custom emoji.
+  function styleEmoji(img, st) {
+    if (st.w) img.classList.add("fx-wiggle");
+    if (st.sh) img.classList.add("fx-shake");
+    if (st.gl) img.classList.add("emoji-glow");
+    if (st.rb) img.classList.add("emoji-rainbow");
+    if (st.w && st.sh) img.classList.add("both-move");
+  }
+
   function renderSpans(el, spans, query = "") {
     el.replaceChildren();
     el.classList.add("fx-text");
@@ -141,7 +150,9 @@ const Fx = (() => {
     for (const span of spans) {
       if (span.e) {
         const img = emojiImg(span.e.f, span.e.n);
-        if (lastSize) img.style.fontSize = `${lastSize}px`;
+        const size = span.sz || lastSize;
+        if (size) img.style.fontSize = `${size}px`;
+        styleEmoji(img, span);
         el.append(img);
         continue;
       }
@@ -589,6 +600,7 @@ const Fx = (() => {
     card.append(title, grid, button);
     api(`/api/emoji-packs/${pack.id}`)
       .then((data) => {
+        title.textContent = `Emoji pack: ${data.pack.name}`;
         for (const emoji of data.pack.emojis.slice(0, 24)) {
           grid.append(emojiImg(emoji.fileId, emoji.name));
         }
@@ -599,6 +611,9 @@ const Fx = (() => {
         }
         if (data.mine) {
           button.textContent = "This is your pack";
+          button.disabled = true;
+        } else if (data.added) {
+          button.textContent = "Added ✓";
           button.disabled = true;
         }
       })
@@ -619,27 +634,72 @@ const Fx = (() => {
     return card;
   }
 
+  // ---------- collapsed packs (remembered per browser) ----------
+  const COLLAPSE_KEY = "lc-collapsed-packs";
+  function collapsedPacks() {
+    try {
+      return new Set(JSON.parse(localStorage.getItem(COLLAPSE_KEY) || "[]"));
+    } catch {
+      return new Set();
+    }
+  }
+  function setCollapsed(packId, collapsed) {
+    const set = collapsedPacks();
+    if (collapsed) set.add(packId);
+    else set.delete(packId);
+    try {
+      localStorage.setItem(COLLAPSE_KEY, JSON.stringify([...set]));
+    } catch {
+      // not saved; fine
+    }
+  }
+
   // ---------- emoji picker ----------
+  const QUICK_REACTIONS = ["👍", "❤️", "😂", "😮", "😢", "😡", "🔥", "🍪", "🎉", "💀"];
   let pickerCallback = null;
 
-  function openPicker(anchor, onPick) {
+  // onPick receives a custom emoji {fileId, name, url} or {unicode: "👍"}.
+  // options.quick adds a row of normal emoji (used for reactions).
+  function openPicker(anchor, onPick, options = {}) {
     const picker = document.getElementById("emoji-picker");
     const body = document.getElementById("emoji-picker-body");
     pickerCallback = onPick;
-    body.replaceChildren();
     const render = () => {
       body.replaceChildren();
+      if (options.quick) {
+        const row = document.createElement("div");
+        row.className = "picker-grid quick-row";
+        for (const ch of QUICK_REACTIONS) {
+          const b = document.createElement("button");
+          b.type = "button";
+          b.textContent = ch;
+          b.addEventListener("mousedown", (event) => event.preventDefault());
+          b.addEventListener("click", () => pickerCallback?.({ unicode: ch }));
+          row.append(b);
+        }
+        body.append(row);
+      }
       if (!Emoji.packs.some((pack) => pack.emojis.length)) {
         const p = document.createElement("p");
         p.className = "hint";
-        p.textContent = "No emojis yet. Make a pack and upload some.";
+        p.textContent = "No custom emojis yet. Make a pack and upload some.";
         body.append(p);
       }
+      const collapsed = collapsedPacks();
       for (const pack of Emoji.packs) {
         if (!pack.emojis.length) continue;
-        const head = document.createElement("div");
+        const head = document.createElement("button");
+        head.type = "button";
         head.className = "picker-pack";
-        head.textContent = pack.name;
+        const isCollapsed = collapsed.has(pack.id);
+        head.textContent = `${isCollapsed ? "▸" : "▾"} ${pack.name}`;
+        head.addEventListener("mousedown", (event) => event.preventDefault());
+        head.addEventListener("click", () => {
+          setCollapsed(pack.id, !isCollapsed);
+          render();
+        });
+        body.append(head);
+        if (isCollapsed) continue;
         const grid = document.createElement("div");
         grid.className = "picker-grid";
         for (const emoji of pack.emojis) {
@@ -648,12 +708,10 @@ const Fx = (() => {
           b.title = `:${emoji.name}:`;
           b.append(emojiImg(emoji.fileId, emoji.name));
           b.addEventListener("mousedown", (event) => event.preventDefault());
-          b.addEventListener("click", () => {
-            pickerCallback?.(emoji);
-          });
+          b.addEventListener("click", () => pickerCallback?.(emoji));
           grid.append(b);
         }
-        body.append(head, grid);
+        body.append(grid);
       }
     };
     render();
@@ -679,7 +737,7 @@ const Fx = (() => {
   document.addEventListener("mousedown", (event) => {
     const picker = document.getElementById("emoji-picker");
     if (picker.hidden) return;
-    if (event.target.closest("#emoji-picker, #emoji-btn, #fx-emoji")) return;
+    if (event.target.closest("#emoji-picker, #emoji-btn, #fx-emoji, .react-btn, .react-add")) return;
     closePicker();
   });
 
@@ -701,47 +759,89 @@ const Fx = (() => {
       p.textContent = "No packs yet. Create one above.";
       list.append(p);
     }
+    const collapsed = collapsedPacks();
     for (const pack of Emoji.packs) {
+      const mine = pack.mine !== false;
       const box = document.createElement("section");
-      box.className = "pack";
+      box.className = "pack" + (collapsed.has(pack.id) ? " collapsed" : "");
       const head = document.createElement("div");
       head.className = "pack-head";
-      const name = document.createElement("input");
-      name.value = pack.name;
-      name.maxLength = 40;
-      name.addEventListener("change", async () => {
-        try {
-          await api(`/api/emoji-packs/${pack.id}`, { method: "PATCH", body: { name: name.value } });
-          pack.name = name.value;
-        } catch (err) {
-          showError(errorEl, err.message);
-        }
+
+      const toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.className = "pack-toggle";
+      const paintToggle = () => {
+        const isCollapsed = box.classList.contains("collapsed");
+        toggle.textContent = isCollapsed ? "▸" : "▾";
+        toggle.title = isCollapsed ? "Show emojis" : "Hide emojis";
+      };
+      toggle.addEventListener("click", () => {
+        box.classList.toggle("collapsed");
+        setCollapsed(pack.id, box.classList.contains("collapsed"));
+        paintToggle();
       });
-      const upload = document.createElement("label");
-      upload.className = "btn ghost small file-btn";
-      upload.textContent = "Upload";
-      const input = document.createElement("input");
-      input.type = "file";
-      input.accept = "image/*";
-      input.multiple = true;
-      upload.append(input);
-      input.addEventListener("change", async () => {
-        const files = [...(input.files || [])];
-        input.value = "";
-        if (!files.length) return;
-        showError(errorEl, "");
-        upload.firstChild.textContent = "Uploading…";
-        const form = new FormData();
-        for (const file of files) form.append("emojis", file);
-        try {
-          const data = await api(`/api/emoji-packs/${pack.id}/emojis`, { method: "POST", body: form });
-          if (data.errors?.length) showError(errorEl, data.errors.join(" "));
-        } catch (err) {
-          showError(errorEl, err.message);
-        }
-        await Emoji.load();
-        renderManager();
-      });
+      paintToggle();
+      head.append(toggle);
+
+      if (mine) {
+        const name = document.createElement("input");
+        name.value = pack.name;
+        name.maxLength = 40;
+        name.addEventListener("change", async () => {
+          try {
+            await api(`/api/emoji-packs/${pack.id}`, { method: "PATCH", body: { name: name.value } });
+            pack.name = name.value;
+          } catch (err) {
+            showError(errorEl, err.message);
+          }
+        });
+        head.append(name);
+      } else {
+        const name = document.createElement("span");
+        name.className = "pack-name";
+        name.textContent = pack.name;
+        const by = document.createElement("span");
+        by.className = "pack-by";
+        by.textContent = pack.ownerName ? `by ${pack.ownerName}` : "added";
+        name.append(" ", by);
+        head.append(name);
+      }
+
+      const count = document.createElement("span");
+      count.className = "pack-count";
+      count.textContent = `${pack.emojis.length}`;
+      head.append(count);
+
+      if (mine) {
+        const upload = document.createElement("label");
+        upload.className = "btn ghost small file-btn";
+        upload.textContent = "Upload";
+        const input = document.createElement("input");
+        input.type = "file";
+        input.accept = "image/*";
+        input.multiple = true;
+        upload.append(input);
+        input.addEventListener("change", async () => {
+          const files = [...(input.files || [])];
+          input.value = "";
+          if (!files.length) return;
+          showError(errorEl, "");
+          upload.firstChild.textContent = "Uploading…";
+          const form = new FormData();
+          for (const file of files) form.append("emojis", file);
+          try {
+            const data = await api(`/api/emoji-packs/${pack.id}/emojis`, { method: "POST", body: form });
+            if (data.errors?.length) showError(errorEl, data.errors.join(" "));
+          } catch (err) {
+            showError(errorEl, err.message);
+          }
+          setCollapsed(pack.id, false);
+          await Emoji.load();
+          renderManager();
+        });
+        head.append(upload);
+      }
+
       const share = document.createElement("button");
       share.type = "button";
       share.className = "btn ghost small";
@@ -757,53 +857,68 @@ const Fx = (() => {
           showError(errorEl, err.message);
         }
       });
+      head.append(share);
+
       const del = document.createElement("button");
       del.type = "button";
       del.className = "btn ghost small danger";
-      del.textContent = "Delete pack";
+      del.textContent = mine ? "Delete pack" : "Remove";
+      del.title = mine ? "Deletes it for everyone who added it" : "Remove from your emojis";
       del.addEventListener("click", async () => {
-        if (!confirm(`Delete the pack "${pack.name}" and its emojis?`)) return;
+        const question = mine
+          ? `Delete the pack "${pack.name}"? It disappears for everyone who added it.`
+          : `Remove "${pack.name}" from your emojis?`;
+        if (!confirm(question)) return;
         await api(`/api/emoji-packs/${pack.id}`, { method: "DELETE" });
         await Emoji.load();
         renderManager();
       });
-      head.append(name, upload, share, del);
+      head.append(del);
+
       const grid = document.createElement("div");
       grid.className = "manage-grid";
       if (!pack.emojis.length) {
         const p = document.createElement("p");
         p.className = "hint";
-        p.textContent = "Empty. Upload PNGs or GIFs.";
+        p.textContent = mine ? "Empty. Upload PNGs or GIFs." : "This pack is empty.";
         grid.append(p);
       }
       for (const emoji of pack.emojis) {
         const cell = document.createElement("div");
         cell.className = "manage-emoji";
         const img = emojiImg(emoji.fileId, emoji.name);
-        const label = document.createElement("input");
-        label.value = emoji.name;
-        label.maxLength = 32;
-        label.title = "Rename (letters, numbers, _)";
-        label.addEventListener("change", async () => {
-          try {
-            await api(`/api/emojis/${emoji.id}`, { method: "PATCH", body: { name: label.value.trim() } });
+        cell.append(img);
+        if (mine) {
+          const label = document.createElement("input");
+          label.value = emoji.name;
+          label.maxLength = 32;
+          label.title = "Rename (letters, numbers, _)";
+          label.addEventListener("change", async () => {
+            try {
+              await api(`/api/emojis/${emoji.id}`, { method: "PATCH", body: { name: label.value.trim() } });
+              await Emoji.load();
+            } catch (err) {
+              label.value = emoji.name;
+              showError(errorEl, err.message);
+            }
+          });
+          const x = document.createElement("button");
+          x.type = "button";
+          x.className = "manage-x";
+          x.title = "Delete emoji";
+          x.textContent = "×";
+          x.addEventListener("click", async () => {
+            await api(`/api/emojis/${emoji.id}`, { method: "DELETE" });
             await Emoji.load();
-          } catch (err) {
-            label.value = emoji.name;
-            showError(errorEl, err.message);
-          }
-        });
-        const x = document.createElement("button");
-        x.type = "button";
-        x.className = "manage-x";
-        x.title = "Delete emoji";
-        x.textContent = "×";
-        x.addEventListener("click", async () => {
-          await api(`/api/emojis/${emoji.id}`, { method: "DELETE" });
-          await Emoji.load();
-          renderManager();
-        });
-        cell.append(img, label, x);
+            renderManager();
+          });
+          cell.append(label, x);
+        } else {
+          const label = document.createElement("span");
+          label.className = "manage-name";
+          label.textContent = emoji.name;
+          cell.append(label);
+        }
         grid.append(cell);
       }
       box.append(head, grid);
@@ -917,7 +1032,13 @@ const Fx = (() => {
           if (!child.dataset?.sentinel) out.push({ t: "\n", st });
         } else if (child.nodeName === "IMG") {
           if (child.dataset?.emojiFile) {
-            out.push({ e: { f: child.dataset.emojiFile, n: child.dataset.emojiName }, st: {} });
+            let emojiSt = {};
+            try {
+              emojiSt = JSON.parse(child.dataset.st || "{}");
+            } catch {
+              emojiSt = {};
+            }
+            out.push({ e: { f: child.dataset.emojiFile, n: child.dataset.emojiName }, st: emojiSt });
           }
         } else if (child.nodeType === Node.ELEMENT_NODE) {
           let next = st;
@@ -956,15 +1077,55 @@ const Fx = (() => {
     if (st.gl) span.classList.add("fx-glow");
   }
 
-  function emojiNode(e) {
+  const EMOJI_KEYS = ["w", "sh", "gl", "rb", "sz"];
+  function emojiStyle(st) {
+    const out = {};
+    for (const key of EMOJI_KEYS) if (st?.[key]) out[key] = st[key];
+    return out;
+  }
+
+  function emojiNode(e, st = {}) {
     const img = document.createElement("img");
     img.className = "fx-emoji";
     img.src = `/api/emoji-files/${e.f}`;
     img.alt = `:${e.n}:`;
     img.dataset.emojiFile = e.f;
     img.dataset.emojiName = e.n;
+    const own = emojiStyle(st);
+    img.dataset.st = JSON.stringify(own);
+    if (own.sz) img.style.fontSize = `${own.sz}px`;
+    styleEmoji(img, own);
     img.contentEditable = "false";
     return img;
+  }
+
+  // Turn typed ":name:" into the emoji itself (keeping the text's style).
+  function convertTokens(model) {
+    if (!Emoji.byName.size) return model;
+    const out = [];
+    let i = 0;
+    while (i < model.length) {
+      const item = model[i];
+      if (!item.e && item.t === ":") {
+        let j = i + 1;
+        let name = "";
+        while (j < model.length && !model[j].e && /[A-Za-z0-9_]/.test(model[j].t) && name.length < 33) {
+          name += model[j].t;
+          j += 1;
+        }
+        if (name && j < model.length && !model[j].e && model[j].t === ":") {
+          const emoji = Emoji.byName.get(name.toLowerCase());
+          if (emoji) {
+            out.push({ e: { f: emoji.fileId, n: emoji.name }, st: emojiStyle(cleanStyle(item.st)) });
+            i = j + 1;
+            continue;
+          }
+        }
+      }
+      out.push(item);
+      i += 1;
+    }
+    return out;
   }
 
   function renderModel(model) {
@@ -982,7 +1143,7 @@ const Fx = (() => {
     for (const item of model) {
       if (item.e) {
         flush();
-        editor.append(emojiNode(item.e));
+        editor.append(emojiNode(item.e, item.st));
         continue;
       }
       const st = cleanStyle(item.st);
@@ -1087,10 +1248,13 @@ const Fx = (() => {
       setSelection(start);
       return;
     }
-    const chosen = model.slice(start, end).filter((item) => !item.e && item.t !== "\n");
+    const chosen = model.slice(start, end).filter((item) => item.e || item.t !== "\n");
     const allHave = toggleKey ? chosen.length > 0 && chosen.every((item) => item.st?.[toggleKey]) : false;
     for (let i = start; i < end; i += 1) {
-      if (model[i].e) continue;
+      if (model[i].e) {
+        model[i] = { e: model[i].e, st: emojiStyle(change({ ...emojiStyle(model[i].st) }, allHave)) };
+        continue;
+      }
       model[i] = { t: model[i].t, st: cleanStyle(change({ ...cleanStyle(model[i].st) }, allHave)) };
     }
     pending = null;
@@ -1131,6 +1295,15 @@ const Fx = (() => {
     pending = null;
     paintPending();
     insertItems([...text].map((ch) => ({ t: ch, st: { ...st } })));
+    if (text.includes(":")) {
+      const { start: caret } = currentOffsets();
+      const before = readModel();
+      const after = convertTokens(before);
+      if (after.length !== before.length) {
+        renderModel(after);
+        setSelection(Math.max(0, caret - (before.length - after.length)));
+      }
+    }
   }
 
   editor.addEventListener("beforeinput", (event) => {
@@ -1196,9 +1369,9 @@ const Fx = (() => {
 
   function serialize() {
     const spans = [];
-    for (const item of readModel()) {
+    for (const item of convertTokens(readModel())) {
       if (item.e) {
-        spans.push({ e: item.e });
+        spans.push({ e: item.e, ...emojiStyle(item.st) });
         continue;
       }
       const st = cleanStyle(item.st);
@@ -1260,7 +1433,9 @@ const Fx = (() => {
   document.getElementById("fx-emoji").addEventListener("click", (event) => {
     saveRange();
     openPicker(event.currentTarget, (emoji) => {
-      insertItems([{ e: { f: emoji.fileId, n: emoji.name }, st: {} }]);
+      const { start } = currentOffsets();
+      const here = pending || styleAt(readModel(), start);
+      insertItems([{ e: { f: emoji.fileId, n: emoji.name }, st: emojiStyle(here) }]);
     });
   });
 
@@ -1534,7 +1709,10 @@ const Fx = (() => {
     const spans = message.fx?.spans || (message.body ? [{ t: message.body }] : []);
     const model = [];
     for (const span of spans) {
-      if (span.e) model.push({ e: span.e, st: {} });
+      if (span.e) {
+        const { e, ...st } = span;
+        model.push({ e, st: emojiStyle(st) });
+      }
       else {
         const { t, ...st } = span;
         for (const ch of t) model.push({ t: ch, st: cleanStyle(st) });
@@ -1747,6 +1925,11 @@ const Fx = (() => {
     openManager,
     openEditor,
     openEditForMessage,
+    emojiImg,
+    async onEmojisChanged() {
+      await Emoji.load();
+      if (document.getElementById("emoji-dialog").open) renderManager();
+    },
     prewarm,
     stop,
   };

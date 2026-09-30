@@ -70,6 +70,13 @@ import {
   copyEmojiPack,
   editMessage,
   deleteMessageContent,
+  packSubscriberIds,
+  isSubscribed,
+  subscribePack,
+  unsubscribePack,
+  migrateCopiedPacks,
+  toggleReaction,
+  countUserReactions,
 } from "./db.js";
 import { sanitizeFx, spansToText, fxAssetIds } from "./fx.js";
 import { makeGifLoop } from "./gifloop.js";
@@ -138,6 +145,19 @@ function attachmentSize(message) {
   );
 }
 
+// [{k, u, n}] -> [{key, count, mine, names}] in first-used order.
+function groupReactions(list, userId) {
+  const groups = new Map();
+  for (const r of list || []) {
+    if (!groups.has(r.k)) groups.set(r.k, { key: r.k, count: 0, mine: false, names: [] });
+    const g = groups.get(r.k);
+    g.count += 1;
+    if (r.u === userId) g.mine = true;
+    if (r.n) g.names.push(r.n);
+  }
+  return [...groups.values()];
+}
+
 function publicMessage(message, userId, blocked = null) {
   const mine = message.sender_id === userId;
   if (message.deleted) {
@@ -201,6 +221,8 @@ function publicMessage(message, userId, blocked = null) {
     fx: message.fx || null,
     fxMime,
     edited: Boolean(message.edited_at),
+    forwarded: Boolean(message.forwarded),
+    reactions: groupReactions(message.reactions, userId),
     totalSize: all.reduce((sum, file) => sum + file.size, 0),
   };
 }
@@ -684,6 +706,8 @@ function publicPack(pack) {
   return {
     id: pack.id,
     name: pack.name,
+    mine: pack.mine !== undefined ? pack.mine : undefined,
+    ownerName: pack.owner_name || null,
     emojis: (pack.emojis || []).map((emoji) => ({
       id: emoji.id,
       name: emoji.name,
@@ -695,11 +719,21 @@ function publicPack(pack) {
 
 async function ownPack(req, res) {
   const pack = await getEmojiPack(req.params.id);
-  if (!pack || pack.owner_id !== req.user.id) {
+  if (!pack) {
     res.status(404).json({ error: "Emoji pack not found." });
     return null;
   }
+  if (pack.owner_id !== req.user.id) {
+    res.status(403).json({ error: "Only the person who made this pack can edit it." });
+    return null;
+  }
   return pack;
+}
+
+// Everyone using a pack sees the creator's changes right away.
+async function notifyPack(packId, ownerId) {
+  const ids = new Set([ownerId, ...(await packSubscriberIds(packId))]);
+  for (const id of ids) io.to(id).emit("emojis-changed", { packId });
 }
 
 const emojiUpload = multer({
@@ -728,7 +762,11 @@ app.get("/api/emoji-packs/:id", requireUser, async (req, res) => {
     res.status(404).json({ error: "That emoji pack no longer exists." });
     return;
   }
-  res.json({ pack: publicPack(pack), mine: pack.owner_id === req.user.id });
+  res.json({
+    pack: publicPack(pack),
+    mine: pack.owner_id === req.user.id,
+    added: await isSubscribed(pack.id, req.user.id),
+  });
 });
 
 app.patch("/api/emoji-packs/:id", requireUser, async (req, res) => {
@@ -740,22 +778,36 @@ app.patch("/api/emoji-packs/:id", requireUser, async (req, res) => {
     return;
   }
   await renameEmojiPack(pack.id, name);
+  await notifyPack(pack.id, pack.owner_id);
   res.json({ ok: true });
 });
 
+// The creator deletes the pack for everyone; anyone else just removes it
+// from their own emojis.
 app.delete("/api/emoji-packs/:id", requireUser, async (req, res) => {
-  const pack = await ownPack(req, res);
-  if (!pack) return;
-  await deleteEmojiPack(pack.id);
+  const pack = await getEmojiPack(req.params.id);
+  if (!pack) {
+    res.status(404).json({ error: "Emoji pack not found." });
+    return;
+  }
+  if (pack.owner_id === req.user.id) {
+    const subscribers = await packSubscriberIds(pack.id);
+    await deleteEmojiPack(pack.id);
+    for (const id of subscribers) io.to(id).emit("emojis-changed", { packId: pack.id });
+  } else {
+    await unsubscribePack(pack.id, req.user.id);
+  }
   res.json({ ok: true });
 });
 
+// "Add to my emojis": links the pack (it keeps following the creator's edits).
 app.post("/api/emoji-packs/:id/copy", requireUser, async (req, res) => {
-  const pack = await copyEmojiPack(req.params.id, req.user.id);
+  const pack = await getEmojiPack(req.params.id);
   if (!pack) {
     res.status(404).json({ error: "That emoji pack no longer exists." });
     return;
   }
+  if (pack.owner_id !== req.user.id) await subscribePack(pack.id, req.user.id);
   res.status(201).json({ pack: publicPack(pack) });
 });
 
@@ -795,14 +847,19 @@ app.post(
       }
     }
     const updated = await getEmojiPack(pack.id);
+    await notifyPack(pack.id, pack.owner_id);
     res.json({ pack: publicPack(updated), errors });
   }
 );
 
 async function ownEmoji(req, res) {
   const emoji = await getEmoji(req.params.id);
-  if (!emoji || emoji.owner_id !== req.user.id) {
+  if (!emoji) {
     res.status(404).json({ error: "Emoji not found." });
+    return null;
+  }
+  if (emoji.owner_id !== req.user.id) {
+    res.status(403).json({ error: "Only the person who made this pack can edit it." });
     return null;
   }
   return emoji;
@@ -817,6 +874,7 @@ app.patch("/api/emojis/:id", requireUser, async (req, res) => {
     return;
   }
   await renameEmoji(emoji.id, name);
+  await notifyPack(emoji.pack_id, emoji.owner_id);
   res.json({ ok: true });
 });
 
@@ -824,6 +882,7 @@ app.delete("/api/emojis/:id", requireUser, async (req, res) => {
   const emoji = await ownEmoji(req, res);
   if (!emoji) return;
   await deleteEmoji(emoji.id);
+  await notifyPack(emoji.pack_id, emoji.owner_id);
   res.json({ ok: true });
 });
 
@@ -1343,6 +1402,124 @@ app.delete("/api/messages/:id", requireUser, async (req, res) => {
   res.json(publicMessage(updated, req.user.id));
 });
 
+// Copies a message (text, styles, effects, files) into other chats. The copy
+// is marked "Forwarded" and doesn't say who wrote the original.
+function duplicateUpload(id) {
+  const newId = crypto.randomUUID();
+  const from = attachmentPath(id);
+  const to = attachmentPath(newId);
+  try {
+    fs.linkSync(from, to); // instant, no extra disk space
+  } catch {
+    try {
+      fs.copyFileSync(from, to);
+    } catch {
+      return null;
+    }
+  }
+  return newId;
+}
+
+app.post("/api/messages/:id/forward", requireUser, async (req, res) => {
+  const message = await getMessage(req.params.id);
+  const source = message ? await userInConversation(message.conversation_id, req.user.id) : null;
+  if (!message || !source || message.deleted) {
+    res.status(404).json({ error: "Message not found." });
+    return;
+  }
+  if ((await blockedIdsBy(req.user.id)).has(message.sender_id)) {
+    res.status(403).json({ error: "You can't forward that message." });
+    return;
+  }
+  const ids = Array.isArray(req.body.conversationIds)
+    ? [...new Set(req.body.conversationIds.map(String))].slice(0, 50)
+    : [];
+  if (!ids.length) {
+    res.status(400).json({ error: "Pick at least one chat." });
+    return;
+  }
+  const myBlocks = await blockedIdsBy(req.user.id);
+  const blockers = await blockerIdsOf(req.user.id);
+  const sent = [];
+  const skipped = [];
+  for (const id of ids) {
+    const conversation = await userInConversation(id, req.user.id);
+    if (!conversation) {
+      skipped.push(id);
+      continue;
+    }
+    if (conversation.type !== "group") {
+      const otherId = conversation.member_ids.find((m) => m !== req.user.id);
+      if (myBlocks.has(otherId) || blockers.has(otherId)) {
+        skipped.push(id);
+        continue;
+      }
+    }
+    // Give the copy its own files so deleting/wiping one never breaks the other.
+    const idMap = new Map();
+    const attachments = [];
+    for (const file of message.attachments || []) {
+      const newId = duplicateUpload(file.id);
+      if (!newId) continue;
+      idMap.set(file.id, newId);
+      attachments.push({ ...file, id: newId, role: file.role === "fx" ? "fx" : "file" });
+    }
+    let fx = message.fx ? JSON.parse(JSON.stringify(message.fx)) : null;
+    if (fx?.effect) {
+      fx.effect.overlays = (fx.effect.overlays || [])
+        .filter((o) => idMap.has(o.a))
+        .map((o) => ({ ...o, a: idMap.get(o.a) }));
+      if (!fx.effect.overlays.length) delete fx.effect.overlays;
+      if (fx.effect.music?.a) {
+        if (idMap.has(fx.effect.music.a)) fx.effect.music.a = idMap.get(fx.effect.music.a);
+        else delete fx.effect.music;
+      }
+      if (!fx.effect.overlays && !fx.effect.music) delete fx.effect;
+    }
+    if (fx && !Object.keys(fx).length) fx = null;
+    const copy = await addMessage(conversation.id, req.user.id, message.body || "", attachments, fx, true);
+    const copyBlockers = await blockerIdsOf(req.user.id);
+    emitToConversation(conversation, "message", (userId) => ({
+      conversationId: conversation.id,
+      ...publicMessage(copy, userId, copyBlockers.has(userId) ? new Set([req.user.id]) : null),
+    }));
+    notifyMembers(conversation, copy, copyBlockers).catch(() => {});
+    sent.push(conversation.id);
+  }
+  res.json({ sent, skipped });
+});
+
+// Reaction keys: "u:<emoji>" for normal emoji, "c:<fileId>:<name>" for custom ones.
+const REACT_UNICODE = /^u:[^\s<>"'`\\]{1,16}$/u;
+const REACT_CUSTOM = /^c:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[A-Za-z0-9_]{1,32}$/i;
+
+app.post("/api/messages/:id/react", requireUser, async (req, res) => {
+  const key = String(req.body.key || "");
+  const message = await getMessage(req.params.id);
+  const conversation = message ? await userInConversation(message.conversation_id, req.user.id) : null;
+  if (!message || !conversation || message.deleted) {
+    res.status(404).json({ error: "Message not found." });
+    return;
+  }
+  if (!REACT_UNICODE.test(key) && !REACT_CUSTOM.test(key)) {
+    res.status(400).json({ error: "That reaction isn't valid." });
+    return;
+  }
+  if (key.startsWith("c:") && !(await emojiFileKnown(key.split(":")[1]))) {
+    res.status(400).json({ error: "That emoji no longer exists." });
+    return;
+  }
+  const already = (message.reactions || []).some((r) => r.k === key && r.u === req.user.id);
+  if (!already && (await countUserReactions(message.id, req.user.id)) >= 20) {
+    res.status(400).json({ error: "That's a lot of reactions already." });
+    return;
+  }
+  await toggleReaction(message.id, req.user.id, key);
+  const updated = await getMessage(message.id);
+  await emitMessageUpdated(conversation, updated);
+  res.json(publicMessage(updated, req.user.id));
+});
+
 app.post("/api/messages/:id/pin", requireUser, async (req, res) => {
   const message = await getMessage(req.params.id);
   if (!message) {
@@ -1504,6 +1681,12 @@ async function runWipe() {
 
 await initDb();
 await initPush();
+try {
+  const moved = await migrateCopiedPacks();
+  if (moved) console.log(`Linked ${moved} copied emoji packs back to their creators.`);
+} catch (err) {
+  console.warn("Emoji pack migration failed:", err.message);
+}
 await runWipe();
 // Make GIFs that were uploaded before looping was added loop too.
 setTimeout(() => {

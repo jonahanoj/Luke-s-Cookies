@@ -24,7 +24,14 @@ function cleanSpan(raw) {
     const f = String(raw.e.f || "");
     const n = String(raw.e.n || "");
     if (!UUID.test(f) || !EMOJI_NAME.test(n)) return null;
-    return { e: { f, n } };
+    const out = { e: { f, n } };
+    // Movement/size/glow effects work on emojis too.
+    if (raw.w) out.w = 1;
+    if (raw.sh) out.sh = 1;
+    if (raw.gl) out.gl = 1;
+    if (raw.rb) out.rb = 1;
+    if (raw.sz !== undefined) out.sz = Math.round(num(raw.sz, 10, 64, 16));
+    return out;
   }
   const t = typeof raw.t === "string" ? raw.t : "";
   if (!t) return null;

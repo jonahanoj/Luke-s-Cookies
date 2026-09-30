@@ -404,6 +404,21 @@
       <button id="fx-skip" class="fx-skip" type="button">Skip ✕</button>
     </div>
 
+    <!-- Forward a message -->
+    <dialog id="forward-dialog" class="forward-dialog">
+      <form method="dialog" id="forward-form">
+        <h2>Forward message</h2>
+        <p>It shows as "Forwarded", without saying who wrote it.</p>
+        <input id="forward-search" placeholder="Search chats" autocomplete="off" />
+        <div id="forward-list" class="forward-list"></div>
+        <p id="forward-error" class="error" hidden></p>
+        <div class="dialog-actions">
+          <button class="btn ghost" value="cancel" type="submit">Cancel</button>
+          <button id="forward-send" class="btn primary" type="button" disabled>Forward</button>
+        </div>
+      </form>
+    </dialog>
+
     <!-- Click an image to enlarge it -->
     <div id="lightbox" class="lightbox" hidden>
       <div class="lightbox-bar">
