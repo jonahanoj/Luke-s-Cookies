@@ -287,12 +287,19 @@ const Crumbs = (() => {
       if (!due) continue;
       if (Object.values(entry.state?.timers || {}).some(Boolean)) redrawEntry(id);
       const now = Date.now() + entry.offset;
-      if (due <= now && Date.now() - entry.tickSent > 1500) {
+      // Fast timers (like gravity in a game) need quick ticks; if a tick
+      // didn't change anything, back off so we don't spam the server.
+      if (due <= now && !entry.tickBusy && Date.now() - entry.tickSent > (entry.tickGap || 150)) {
         entry.tickSent = Date.now();
-        press(id, { type: "tick" });
+        entry.tickBusy = true;
+        const before = entry.state?.seq || 0;
+        press(id, { type: "tick" }).finally(() => {
+          entry.tickBusy = false;
+          entry.tickGap = (entry.state?.seq || 0) !== before ? 150 : 1500;
+        });
       }
     }
-  }, 250);
+  }, 100);
 
   // ---------- builder ----------
   const dialog = $("crumb-dialog");
@@ -1154,7 +1161,7 @@ const Crumbs = (() => {
         playFired(result.fired, localUrl);
       }
       if (E.nextDue(testState) || result.changed) paint();
-    }, 200);
+    }, 60);
   }
 
   function stopTest() {
