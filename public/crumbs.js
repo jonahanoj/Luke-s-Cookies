@@ -329,7 +329,8 @@ const Crumbs = (() => {
   }
 
   function resetBuilder() {
-    for (const a of assets.values()) if (a.file) URL.revokeObjectURL(a.url);
+    for (const a of assets.values()) if (a.file && !a.remote) URL.revokeObjectURL(a.url);
+    $("cb-import").hidden = true;
     assets = new Map();
     def = null;
     selected = null;
@@ -1166,12 +1167,219 @@ const Crumbs = (() => {
     startTest();
   });
 
+  // ---------- crumb codes (copy / import) ----------
+  // A crumb code is the whole crumb (layout, rules, and its images/sounds)
+  // squished into one line of text you can paste anywhere.
+  const CODE_PREFIX = "CRUMB1.";
+  const MAX_CODE_ASSETS = 4 * 1024 * 1024;
+
+  const toB64 = (bytes) => {
+    let bin = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+    return btoa(bin);
+  };
+  const fromB64 = (text) => Uint8Array.from(atob(text), (c) => c.charCodeAt(0));
+  const urlSafe = (b64) => b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const fromUrlSafe = (text) => {
+    const b64 = text.replace(/-/g, "+").replace(/_/g, "/");
+    return b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+  };
+
+  async function squish(bytes, mode) {
+    const stream = new Blob([bytes]).stream().pipeThrough(new (mode === "in" ? CompressionStream : DecompressionStream)("deflate-raw"));
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+  }
+
+  function assetKeysOf(crumb) {
+    const keys = new Set();
+    for (const el of crumb.elements || []) if (el.asset != null) keys.add(el.asset);
+    for (const rule of crumb.rules || []) for (const a of rule.do || []) if (a.asset != null) keys.add(a.asset);
+    return keys;
+  }
+
+  // crumb: a definition; urlFor(key) gives a URL to fetch each image/sound.
+  async function makeCode(crumb, urlFor) {
+    const packed = { v: 1, crumb, assets: {} };
+    let total = 0;
+    let skipped = 0;
+    for (const key of assetKeysOf(crumb)) {
+      try {
+        const blob = await (await fetch(urlFor(key))).blob();
+        if (total + blob.size > MAX_CODE_ASSETS) {
+          skipped += 1;
+          continue;
+        }
+        total += blob.size;
+        packed.assets[key] = { t: blob.type || "", d: toB64(new Uint8Array(await blob.arrayBuffer())) };
+      } catch {
+        skipped += 1;
+      }
+    }
+    let bytes = new TextEncoder().encode(JSON.stringify(packed));
+    let mark = "z";
+    if (typeof CompressionStream === "function") bytes = await squish(bytes, "in");
+    else mark = "j";
+    return { code: `${CODE_PREFIX}${mark}${urlSafe(toB64(bytes))}`, skipped };
+  }
+
+  async function readCode(text) {
+    const clean = String(text || "").replace(/\s+/g, "");
+    const at = clean.indexOf(CODE_PREFIX);
+    if (at < 0) throw new Error("That doesn't look like a crumb code.");
+    const body = clean.slice(at + CODE_PREFIX.length);
+    let bytes = fromB64(fromUrlSafe(body.slice(1)));
+    if (body[0] === "z") {
+      if (typeof DecompressionStream !== "function") throw new Error("This browser is too old to open crumb codes.");
+      bytes = await squish(bytes, "out");
+    }
+    const packed = JSON.parse(new TextDecoder().decode(bytes));
+    if (!packed?.crumb) throw new Error("That crumb code is broken.");
+    return packed;
+  }
+
+  async function copyText(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // Older/locked-down browsers: fall back to a hidden text box.
+      const area = document.createElement("textarea");
+      area.value = text;
+      area.style.position = "fixed";
+      area.style.opacity = "0";
+      (dialog.open ? dialog : document.body).append(area);
+      area.select();
+      let ok = false;
+      try {
+        ok = document.execCommand("copy");
+      } catch {}
+      area.remove();
+      return ok;
+    }
+  }
+
+  // From the message menu: copy the code of a crumb someone sent.
+  async function copyCodeOf(message) {
+    if (!message?.fx?.crumb) return;
+    try {
+      const { code, skipped } = await makeCode(message.fx.crumb, (id) => `/api/attachments/${id}`);
+      const ok = await copyText(code);
+      showError(
+        composeError,
+        ok
+          ? `Crumb code copied!${skipped ? ` (${skipped} picture/sound was too big to include.)` : ""}`
+          : "Couldn't copy. Your browser blocked the clipboard."
+      );
+    } catch (err) {
+      showError(composeError, err.message);
+    }
+  }
+
+  // Open a sent crumb in the builder as a brand-new copy you can change.
+  function remix(message) {
+    if (!message?.fx?.crumb) return;
+    resetBuilder();
+    def = JSON.parse(JSON.stringify(message.fx.crumb));
+    const keys = assetKeysOf(def);
+    // Their images/sounds get downloaded and re-uploaded with your version.
+    for (const key of keys) assets.set(key, { file: null, url: `/api/attachments/${key}`, remote: true });
+    nextId = def.elements.length + def.timers.length + 50;
+    openLoaded();
+  }
+
+  function openLoaded() {
+    $("cb-title").value = def.title || "";
+    $("cb-aspect").value = def.aspect || "square";
+    $("cb-bg").value = def.bg || "#fff7ec";
+    showError(errorEl, "");
+    paintMode();
+    setTab("build");
+    if (!dialog.open) dialog.showModal();
+  }
+
+  async function loadCode(text) {
+    const packed = await readCode(text);
+    const raw = packed.crumb;
+    // Give every image/sound a fresh local key.
+    const map = new Map();
+    const files = new Map();
+    for (const [key, data] of Object.entries(packed.assets || {})) {
+      const local = uid("asset");
+      const file = new File([fromB64(data.d)], data.t?.startsWith("audio/") ? "sound" : "image", { type: data.t || "" });
+      map.set(String(key), local);
+      files.set(local, file);
+    }
+    const fix = (value) => (value != null && map.has(String(value)) ? map.get(String(value)) : null);
+    const copy = JSON.parse(JSON.stringify(raw));
+    for (const el of copy.elements || []) if (el.asset != null) el.asset = fix(el.asset);
+    for (const rule of copy.rules || []) for (const a of rule.do || []) if (a.asset != null) a.asset = fix(a.asset);
+    const clean = E.sanitize(copy, (key) => (files.has(key) ? key : null));
+    if (!clean) throw new Error("That crumb code is empty.");
+    resetBuilder();
+    for (const [key, file] of files) assets.set(key, { file, url: URL.createObjectURL(file) });
+    def = clean;
+    nextId = def.elements.length + def.timers.length + 50;
+    openLoaded();
+  }
+
+  $("cb-import-open").addEventListener("click", () => {
+    $("cb-import").hidden = false;
+    $("cb-import-text").value = "";
+    $("cb-import-text").focus();
+  });
+  $("cb-import-cancel").addEventListener("click", () => ($("cb-import").hidden = true));
+  $("cb-import-load").addEventListener("click", async () => {
+    showError(errorEl, "");
+    const text = $("cb-import-text").value;
+    if (def?.elements?.length && !confirm("Replace what you're building with this crumb?")) return;
+    try {
+      await loadCode(text);
+      $("cb-import").hidden = true;
+    } catch (err) {
+      showError(errorEl, err.message || "That crumb code didn't work.");
+    }
+  });
+
+  $("cb-copy-code").addEventListener("click", async () => {
+    showError(errorEl, "");
+    const clean = sanitizedPreview();
+    if (!clean) {
+      showError(errorEl, "Add something to your crumb first.");
+      return;
+    }
+    const button = $("cb-copy-code");
+    button.disabled = true;
+    try {
+      const { code, skipped } = await makeCode(clean, localUrl);
+      const ok = await copyText(code);
+      button.textContent = ok ? "✅ Copied" : "Couldn't copy";
+      if (skipped) showError(errorEl, `${skipped} picture/sound was too big to go in the code.`);
+      setTimeout(() => (button.textContent = "📋 Copy code"), 1500);
+    } catch (err) {
+      showError(errorEl, err.message);
+    } finally {
+      button.disabled = false;
+    }
+  });
+
   // ---------- send ----------
   $("cb-send").addEventListener("click", async () => {
     showError(errorEl, "");
     const clean = sanitizedPreview();
     if (!clean) {
       showError(errorEl, "Add at least one thing to your crumb.");
+      return;
+    }
+    // Remixed images/sounds from someone else's crumb: download them so they
+    // get uploaded with your copy.
+    try {
+      for (const [key, a] of assets) {
+        if (!a.remote || a.file) continue;
+        const blob = await (await fetch(a.url)).blob();
+        a.file = new File([blob], "asset", { type: blob.type });
+      }
+    } catch {
+      showError(errorEl, "Couldn't download one of the pictures/sounds.");
       return;
     }
     // Local asset keys → upload order (images already sent keep their id).
@@ -1216,5 +1424,5 @@ const Crumbs = (() => {
 
   dialog.addEventListener("close", stopTest);
 
-  return { openBuilder, openEdit, renderCard, onRemoteState };
+  return { openBuilder, openEdit, renderCard, onRemoteState, copyCodeOf, remix };
 })();

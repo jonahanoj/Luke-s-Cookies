@@ -601,7 +601,17 @@
           </section>
         </div>
         <p id="cb-error" class="error" hidden></p>
+        <div id="cb-import" class="cb-import" hidden>
+          <textarea id="cb-import-text" rows="3" placeholder="Paste a crumb code here"></textarea>
+          <div class="cb-import-btns">
+            <button id="cb-import-cancel" class="btn ghost small" type="button">Cancel</button>
+            <button id="cb-import-load" class="btn primary small" type="button">Load it</button>
+          </div>
+        </div>
         <footer class="cb-foot">
+          <button id="cb-import-open" class="btn ghost small" type="button">📥 Import code</button>
+          <button id="cb-copy-code" class="btn ghost small" type="button">📋 Copy code</button>
+          <span class="cb-foot-gap"></span>
           <button id="cb-send" class="btn primary" type="button">Send crumb</button>
         </footer>
       </div>

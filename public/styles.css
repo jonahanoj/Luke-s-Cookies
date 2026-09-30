@@ -3446,12 +3446,51 @@ html.scr-shake {
 
 .cb-foot {
   display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
   justify-content: flex-end;
   padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
   border-top: 1px solid var(--line);
 }
 
 .cb-foot .btn.primary {
+  width: auto;
+}
+
+.cb-foot .btn.small {
+  width: auto;
+}
+
+.cb-foot-gap {
+  flex: 1;
+}
+
+.cb-import {
+  padding: 10px 12px 0;
+  border-top: 1px solid var(--line);
+}
+
+.cb-import[hidden] {
+  display: none;
+}
+
+.cb-import textarea {
+  margin: 0;
+  min-height: 70px;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.cb-import-btns {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.cb-import-btns .btn {
   width: auto;
 }
 
