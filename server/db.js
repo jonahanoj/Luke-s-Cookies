@@ -2195,6 +2195,46 @@ export async function giveStars(messageId, giverId, receiverId, stars, day) {
 
 // ---- read receipts ----
 
+// How many messages in each chat this user hasn't read yet (from other people).
+export async function unreadCounts(userId) {
+  const counts = new Map();
+  if (pool) {
+    const rows = await pgQuery(
+      `SELECT m.conversation_id, COUNT(*)::int AS n
+       FROM messages m
+       JOIN conversations c ON c.id = m.conversation_id
+       LEFT JOIN conversation_reads r ON r.conversation_id = m.conversation_id AND r.user_id = $1
+       WHERE m.sender_id <> $1
+         AND m.scheduled_for IS NULL
+         AND NOT COALESCE(m.deleted, FALSE)
+         AND (r.read_at IS NULL OR date_trunc('milliseconds', m.created_at) > r.read_at)
+         AND (
+           c.user_low = $1 OR c.user_high = $1
+           OR EXISTS (SELECT 1 FROM conversation_members cm WHERE cm.conversation_id = c.id AND cm.user_id = $1)
+         )
+       GROUP BY m.conversation_id`,
+      [userId]
+    );
+    for (const row of rows) counts.set(row.conversation_id, row.n);
+    return counts;
+  }
+  const reads = new Map(
+    fileStore.conversation_reads.filter((r) => r.user_id === userId).map((r) => [r.conversation_id, String(r.read_at)])
+  );
+  const mine = new Set(
+    fileStore.conversations
+      .filter((c) => (c.members || [c.user_low, c.user_high]).includes(userId))
+      .map((c) => c.id)
+  );
+  for (const m of fileStore.messages) {
+    if (!mine.has(m.conversation_id) || m.sender_id === userId || m.scheduled_for || m.deleted) continue;
+    const readAt = reads.get(m.conversation_id);
+    if (readAt && String(m.created_at) <= readAt) continue;
+    counts.set(m.conversation_id, (counts.get(m.conversation_id) || 0) + 1);
+  }
+  return counts;
+}
+
 export async function setRead(conversationId, userId, readAt) {
   if (pool) {
     await pgQuery(

@@ -175,9 +175,9 @@ const Crumbs = (() => {
       entry.state = incoming;
       entry.server = incoming;
       entry.outbox = [];
-    } else if (incoming && (incoming.seq || 0) >= (entry.server?.seq || 0)) {
+    } else if (incoming && (incoming.seq || 0) >= (entry.state?.seq || 0)) {
+      entry.state = incoming;
       entry.server = incoming;
-      if (!entry.inflight && !entry.outbox?.length) entry.state = incoming;
     }
     if (message.serverNow) entry.offset = message.serverNow - Date.now();
     return entry;
@@ -204,64 +204,37 @@ const Crumbs = (() => {
     });
   }
 
-  // This tab's id, so we can ignore the echo of our own presses.
-  const tabId = Math.random().toString(36).slice(2, 12);
-
-  // Presses show up instantly here (we run the same rules locally), then get
-  // sent to the server in batches. The server's answer is the final word.
-  function press(id, event) {
+  // The server runs the rules and sends back the result (same as before).
+  async function press(id, event) {
     const entry = live.get(id);
     if (!entry) return;
-    const result = E.apply(entry.def, entry.state, event, Date.now() + entry.offset);
-    if (result.changed) {
-      entry.state = result.state;
-      redrawEntry(id);
-      playFired(result.fired, serverUrl, id);
-    }
-    entry.outbox = entry.outbox || [];
-    entry.outbox.push(event);
-    flush(id);
-  }
-
-  async function flush(id) {
-    const entry = live.get(id);
-    if (!entry || entry.inflight || !entry.outbox?.length) return;
-    const events = entry.outbox.splice(0, 60);
-    entry.inflight = true;
-    let data = null;
     try {
-      data = await api(`/api/messages/${id}/crumb`, { method: "POST", body: { events, cid: tabId } });
+      const data = await api(`/api/messages/${id}/crumb`, { method: "POST", body: { event } });
+      applyRemote(data, true);
     } catch (err) {
       showError(composeError, err.message);
     }
-    entry.inflight = false;
-    if (data) {
-      if (data.serverNow) entry.offset = data.serverNow - Date.now();
-      if (!entry.server || (data.state.seq || 0) >= (entry.server.seq || 0)) entry.server = data.state;
-    }
-    if (entry.outbox.length) {
-      flush(id);
-      return;
-    }
-    // Nothing else waiting: line up with the server exactly.
-    if (entry.server && JSON.stringify(entry.server) !== JSON.stringify(entry.state)) {
-      entry.state = entry.server;
-      redrawEntry(id);
-    }
+  }
+
+  function applyRemote(payload, fromMe = false) {
+    const entry = live.get(payload.messageId);
+    if (!entry) return;
+    if ((payload.state.seq || 0) < (entry.state?.seq || 0)) return;
+    const changed = (payload.state.seq || 0) !== (entry.state?.seq || 0);
+    entry.state = payload.state;
+    entry.server = payload.state;
+    if (payload.serverNow) entry.offset = payload.serverNow - Date.now();
+    redrawEntry(payload.messageId);
+    // Everyone gets the screen effects/sounds once (the socket event), not twice.
+    if (changed && fromMe) entry.lastFiredSeq = payload.state.seq;
+    if (changed) playFired(payload.fired, serverUrl, payload.messageId);
   }
 
   function onRemoteState(payload) {
     const entry = live.get(payload.messageId);
     if (!entry) return;
-    if (payload.cid && payload.cid === tabId) return; // our own press, already shown
-    if ((payload.state.seq || 0) < (entry.server?.seq || 0)) return;
-    entry.server = payload.state;
-    if (payload.serverNow) entry.offset = payload.serverNow - Date.now();
-    playFired(payload.fired, serverUrl, payload.messageId);
-    // If we're mid-click, our next server answer will include this anyway.
-    if (entry.inflight || entry.outbox?.length) return;
-    entry.state = payload.state;
-    redrawEntry(payload.messageId);
+    if (entry.lastFiredSeq === payload.state.seq) return; // already handled from our own press
+    applyRemote(payload);
   }
 
   function renderCard(message) {

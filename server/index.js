@@ -86,6 +86,7 @@ import {
   setRead,
   listReads,
   setCrumbState,
+  unreadCounts,
   dueScheduledMessages,
   markDelivered,
   hardDeleteMessage,
@@ -263,7 +264,8 @@ function publicMessage(message, userId, blocked = null) {
     stars: publicStars(message, userId),
     boomSeen: message.fx?.boom ? (message.views || []).length : undefined,
     crumbState: message.fx?.crumb
-      ? message.crumb_state || globalThis.CrumbsEngine.initialState(message.fx.crumb, Date.parse(message.created_at))
+      ? message.crumb_state ||
+        globalThis.CrumbsEngine.initialState(message.fx.crumb, Date.parse(message.created_at))
       : undefined,
     serverNow: message.fx?.crumb ? Date.now() : undefined,
   };
@@ -741,6 +743,16 @@ app.post("/api/push/subscribe", requireUser, async (req, res) => {
   res.json({ ok: true });
 });
 
+// Sends yourself a test notification (to every device you turned them on for).
+app.post("/api/push/test", requireUser, async (req, res) => {
+  const result = await sendPush(req.user.id, {
+    title: "Luke's Cookies",
+    body: "Notifications work! 🍪",
+    tag: "test",
+  });
+  res.json(result || { devices: 0, sent: 0 });
+});
+
 app.post("/api/push/unsubscribe", requireUser, async (req, res) => {
   const endpoint = String(req.body.endpoint || "");
   if (endpoint) await removePushSubscription(endpoint);
@@ -1018,6 +1030,7 @@ app.get("/api/users", requireUser, async (req, res) => {
 app.get("/api/conversations", requireUser, async (req, res) => {
   const conversations = await listConversations(req.user.id);
   const muted = await mutedConversationIds(req.user.id);
+  const unread = await unreadCounts(req.user.id);
   const blocked = await blockedIdsBy(req.user.id);
   res.json({
     conversations: conversations.map((item) => ({
@@ -1037,6 +1050,7 @@ app.get("/api/conversations", requireUser, async (req, res) => {
         (item.members || []).find((member) => member.id === item.created_by)?.username || null,
       canRemove:
         item.type === "group" && (!item.created_by || item.created_by === req.user.id),
+      unread: unread.get(item.id) || 0,
       lastMessage: item.last_message,
       lastAt: item.last_at,
       members: (item.members || [])
@@ -1844,8 +1858,13 @@ app.post("/api/messages/:id/crumb", requireUser, async (req, res) => {
     res.status(400).json({ error: "That message isn't a crumb." });
     return;
   }
-  const event = req.body.event || {};
-  if (!["press", "tick"].includes(event.type)) {
+  // Presses can come in batches (fast clicking), applied in order.
+  const raw = Array.isArray(req.body.events) ? req.body.events : [req.body.event || {}];
+  const events = raw
+    .slice(0, 60)
+    .filter((event) => event && ["press", "tick"].includes(event.type))
+    .map((event) => ({ type: event.type, el: String(event.el || "") }));
+  if (!events.length) {
     res.status(400).json({ error: "Unknown action." });
     return;
   }
@@ -1853,10 +1872,17 @@ app.post("/api/messages/:id/crumb", requireUser, async (req, res) => {
   const previous = crumbLocks.get(message.id) || Promise.resolve();
   const job = previous.then(async () => {
     const latest = await getMessage(message.id);
-    const current = latest.crumb_state || globalThis.CrumbsEngine.initialState(def, Date.parse(latest.created_at));
-    const result = globalThis.CrumbsEngine.apply(def, current, { type: event.type, el: String(event.el || "") }, Date.now());
-    if (result.changed) await setCrumbState(message.id, result.state);
-    return result;
+    let state = latest.crumb_state || globalThis.CrumbsEngine.initialState(def, Date.parse(latest.created_at));
+    const fired = [];
+    let changed = false;
+    for (const event of events) {
+      const result = globalThis.CrumbsEngine.apply(def, state, event, Date.now());
+      state = result.state;
+      fired.push(...result.fired);
+      if (result.changed) changed = true;
+    }
+    if (changed) await setCrumbState(message.id, state);
+    return { state, fired: fired.slice(0, 40), changed };
   });
   crumbLocks.set(message.id, job.catch(() => {}));
   const result = await job;
@@ -1866,6 +1892,7 @@ app.post("/api/messages/:id/crumb", requireUser, async (req, res) => {
     state: result.state,
     fired: result.fired,
     by: req.user.username,
+    cid: typeof req.body.cid === "string" ? req.body.cid.slice(0, 40) : null,
     serverNow: Date.now(),
   };
   if (result.changed) emitToConversation(conversation, "crumb", () => payload);
