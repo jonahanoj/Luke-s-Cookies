@@ -97,7 +97,8 @@ export function sanitizeFx(raw, assetIds) {
           a,
           x: num(item.x, 0, 100, 50),
           y: num(item.y, 0, 100, 50),
-          w: num(item.w, 2, 100, 30),
+          w: num(item.w, 2, 150, 40),
+          r: Math.round(num(item.r, -180, 180, 0)),
           s: start,
           e: end,
         });

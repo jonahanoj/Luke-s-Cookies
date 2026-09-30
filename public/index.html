@@ -349,23 +349,21 @@
           <button type="button" id="fx-emoji" title="Insert emoji">☺</button>
           <button type="button" data-cmd="clear" title="Remove styles from selection">Clear style</button>
         </div>
+        <div id="fx-pending" class="fx-pending" hidden></div>
         <div id="fx-editor" class="fx-editor" contenteditable="true" spellcheck="true" data-placeholder="Type, select some text, then pick a style…"></div>
 
         <section class="fx-section">
           <h3>Screen effect <span class="hint-inline">plays once when they open the chat, up to 10 seconds</span></h3>
-          <div class="fx-stage-wrap">
-            <div id="fx-stage" class="fx-stage"><span class="stage-hint">Their screen. Add an image or GIF, then drag it where you want.</span></div>
+          <div class="fx-row">
+            <div id="fx-overlay-list" class="fx-overlay-list"></div>
+            <span id="fx-overlay-empty" class="hint-inline">No images yet.</span>
           </div>
           <div class="fx-row">
             <label class="btn ghost small file-btn">
               Add image / GIF
               <input id="fx-overlay-input" type="file" accept="image/*" multiple />
             </label>
-          </div>
-          <div id="fx-overlay-edit" class="fx-overlay-edit" hidden>
-            <label>Size <input id="fx-ov-size" type="range" min="2" max="100" step="1" /> <span id="fx-ov-size-val"></span></label>
-            <label>Show from <input id="fx-ov-start" type="number" min="0" max="9.5" step="0.5" />s to <input id="fx-ov-end" type="number" min="0.5" max="10" step="0.5" />s</label>
-            <button id="fx-ov-remove" class="btn ghost small danger" type="button">Remove</button>
+            <button id="fx-place" class="btn ghost small" type="button" hidden>Move / resize / rotate on screen</button>
           </div>
         </section>
 

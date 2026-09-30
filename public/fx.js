@@ -232,8 +232,35 @@ const Fx = (() => {
     });
     const el = layer();
     el.classList.remove("show");
-    for (const node of [...el.querySelectorAll(".fx-overlay")]) node.remove();
+    for (const node of [...el.querySelectorAll(".fx-frame")]) node.remove();
     el.hidden = true;
+  }
+
+  // Effects are laid out inside a phone-shaped area in the middle of the
+  // screen, so what the sender places is visible on phones too.
+  function frameRect() {
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const width = Math.min(vw, vh * 0.5);
+    return { left: (vw - width) / 2, top: 0, width, height: vh };
+  }
+
+  function makeFrame() {
+    const rect = frameRect();
+    const frame = document.createElement("div");
+    frame.className = "fx-frame";
+    frame.style.left = `${rect.left}px`;
+    frame.style.top = `${rect.top}px`;
+    frame.style.width = `${rect.width}px`;
+    frame.style.height = `${rect.height}px`;
+    return frame;
+  }
+
+  function placeOverlay(node, overlay) {
+    node.style.left = `${overlay.x}%`;
+    node.style.top = `${overlay.y}%`;
+    node.style.width = `${overlay.w}%`;
+    node.style.setProperty("--rot", `${overlay.r || 0}deg`);
   }
 
   // effect: { overlays: [{a,x,y,w,s,e}], music: {a|yt, s, e, v} }
@@ -247,16 +274,16 @@ const Fx = (() => {
     el.hidden = false;
     requestAnimationFrame(() => el.classList.add("show"));
     let total = 0;
+    const frame = makeFrame();
+    el.append(frame);
 
     for (const overlay of effect.overlays || []) {
       const img = document.createElement("img");
       img.className = "fx-overlay";
       img.src = urlFor(overlay.a);
       img.alt = "";
-      img.style.left = `${overlay.x}%`;
-      img.style.top = `${overlay.y}%`;
-      img.style.width = `${overlay.w}vw`;
-      el.append(img);
+      placeOverlay(img, overlay);
+      frame.append(img);
       const start = Math.max(0, overlay.s || 0) * 1000;
       const end = Math.min(MAX_SECONDS, overlay.e || MAX_SECONDS) * 1000;
       total = Math.max(total, end);
@@ -633,15 +660,35 @@ const Fx = (() => {
   }
 
   // ---------- the editor ----------
+  // The text box is driven by a simple model: a list of characters, each with
+  // its own style. Styles are applied to the model and the box is redrawn as
+  // flat spans (never nested), which keeps Clear style / colors predictable.
   const editorDialog = document.getElementById("fx-dialog");
   const editor = document.getElementById("fx-editor");
-  const stage = document.getElementById("fx-stage");
   const fxError = document.getElementById("fx-error");
+  const STYLE_KEYS = ["b", "i", "u", "s", "c", "g", "rb", "w", "sh", "gl", "sz"];
   let savedRange = null;
+  let pending = null; // style for the next thing typed at a collapsed caret
   let overlays = [];
   let selectedOverlay = null;
   let audioFile = null;
   let nextOverlayId = 1;
+
+  function cleanStyle(st) {
+    const out = {};
+    for (const key of STYLE_KEYS) {
+      const value = st?.[key];
+      if (value === undefined || value === null || value === false || value === "") continue;
+      out[key] = value;
+    }
+    if (out.c) {
+      delete out.g;
+      delete out.rb;
+    } else if (out.g) delete out.rb;
+    return out;
+  }
+
+  const styleKey = (st) => JSON.stringify(cleanStyle(st));
 
   function gradColors() {
     return [...document.querySelectorAll("#fx-grad-colors input")].map((input) => input.value);
@@ -661,192 +708,602 @@ const Fx = (() => {
     }
   }
 
-  function saveRange() {
-    const sel = window.getSelection();
-    if (sel.rangeCount && editor.contains(sel.anchorNode)) savedRange = sel.getRangeAt(0).cloneRange();
+  // ----- model <-> DOM -----
+  const ZWSP = String.fromCharCode(0x200b);
+  const NBSP = String.fromCharCode(0xa0);
+  const cleanText = (text) => text.split(ZWSP).join("").split(NBSP).join(" ");
+
+  function readModel(root = editor) {
+    const out = [];
+    const walk = (node, st) => {
+      for (const child of node.childNodes) {
+        if (child.nodeType === Node.TEXT_NODE) {
+          // Loose text next to a styled span (from phone keyboards) takes its style.
+          let textStyle = st;
+          if (node === editor && child.previousSibling?.dataset?.st) {
+            try {
+              textStyle = JSON.parse(child.previousSibling.dataset.st);
+            } catch {
+              textStyle = st;
+            }
+          }
+          for (const ch of cleanText(child.nodeValue)) {
+            out.push({ t: ch, st: textStyle });
+          }
+        } else if (child.nodeName === "BR") {
+          if (!child.dataset?.sentinel) out.push({ t: "\n", st });
+        } else if (child.nodeName === "IMG") {
+          if (child.dataset?.emojiFile) {
+            out.push({ e: { f: child.dataset.emojiFile, n: child.dataset.emojiName }, st: {} });
+          }
+        } else if (child.nodeType === Node.ELEMENT_NODE) {
+          let next = st;
+          if (child.dataset?.st) {
+            try {
+              next = JSON.parse(child.dataset.st);
+            } catch {
+              next = st;
+            }
+          }
+          const block = child.nodeName === "DIV" || child.nodeName === "P";
+          if (block && out.length && out[out.length - 1].t !== "\n") out.push({ t: "\n", st });
+          walk(child, next);
+        }
+      }
+    };
+    walk(root, {});
+    return out;
   }
 
-  document.addEventListener("selectionchange", () => {
-    if (editorDialog.open) saveRange();
-  });
-
-  function restoreRange() {
-    if (!savedRange) return null;
-    const sel = window.getSelection();
-    sel.removeAllRanges();
-    sel.addRange(savedRange);
-    return savedRange;
-  }
-
-  function styleEditorSpan(span) {
-    const d = span.dataset;
+  function styleEditorSpan(span, st) {
     span.style.cssText = "";
     span.className = "";
-    if (d.b) span.style.fontWeight = "700";
-    if (d.i) span.style.fontStyle = "italic";
-    const deco = [d.u && "underline", d.s && "line-through"].filter(Boolean).join(" ");
+    if (st.b) span.style.fontWeight = "700";
+    if (st.i) span.style.fontStyle = "italic";
+    const deco = [st.u && "underline", st.s && "line-through"].filter(Boolean).join(" ");
     if (deco) span.style.textDecoration = deco;
-    if (d.sz) span.style.fontSize = `${d.sz}px`;
-    if (d.c) span.style.color = d.c;
-    if (d.g) {
+    if (st.sz) span.style.fontSize = `${st.sz}px`;
+    if (st.c) span.style.color = st.c;
+    else if (st.g) {
       span.classList.add("fx-grad");
-      span.style.backgroundImage = `linear-gradient(90deg, ${d.g})`;
-    }
-    if (d.rb) span.classList.add("fx-rainbow");
-    if (d.w) span.classList.add("ed-wiggle");
-    if (d.sh) span.classList.add("ed-shake");
-    if (d.gl) span.classList.add("fx-glow");
+      span.style.backgroundImage = `linear-gradient(90deg, ${st.g.join(", ")})`;
+    } else if (st.rb) span.classList.add("fx-rainbow");
+    if (st.w) span.classList.add("ed-wiggle");
+    if (st.sh) span.classList.add("ed-shake");
+    if (st.gl) span.classList.add("fx-glow");
   }
 
-  function applyStyle(attrs) {
-    const range = restoreRange();
-    if (!range || range.collapsed || !editor.contains(range.commonAncestorContainer)) {
-      showError(fxError, "Select some text in the box first.");
-      return;
+  function emojiNode(e) {
+    const img = document.createElement("img");
+    img.className = "fx-emoji";
+    img.src = `/api/emoji-files/${e.f}`;
+    img.alt = `:${e.n}:`;
+    img.dataset.emojiFile = e.f;
+    img.dataset.emojiName = e.n;
+    img.contentEditable = "false";
+    return img;
+  }
+
+  function renderModel(model) {
+    editor.replaceChildren();
+    let run = null;
+    const flush = () => {
+      if (!run) return;
+      const span = document.createElement("span");
+      span.dataset.st = JSON.stringify(run.st);
+      span.textContent = run.text;
+      styleEditorSpan(span, run.st);
+      editor.append(span);
+      run = null;
+    };
+    for (const item of model) {
+      if (item.e) {
+        flush();
+        editor.append(emojiNode(item.e));
+        continue;
+      }
+      const st = cleanStyle(item.st);
+      // Moving text is drawn per line so wiggle/shake never swallow line breaks.
+      if (run && styleKey(run.st) === styleKey(st) && item.t !== "\n" && !run.text.endsWith("\n")) {
+        run.text += item.t;
+      } else {
+        flush();
+        run = { st, text: item.t };
+      }
     }
-    showError(fxError, "");
-    const span = document.createElement("span");
-    for (const [key, value] of Object.entries(attrs)) span.dataset[key] = value;
-    span.append(range.extractContents());
-    range.insertNode(span);
-    styleEditorSpan(span);
+    flush();
+    if (model.length && model[model.length - 1].t === "\n") {
+      const br = document.createElement("br");
+      br.dataset.sentinel = "1";
+      editor.append(br);
+    }
+  }
+
+  function countBefore(container, offset) {
+    const range = document.createRange();
+    range.setStart(editor, 0);
+    try {
+      range.setEnd(container, offset);
+    } catch {
+      return 0;
+    }
+    const holder = document.createElement("div");
+    holder.append(range.cloneContents());
+    return readModel(holder).length;
+  }
+
+  function currentOffsets() {
     const sel = window.getSelection();
-    sel.removeAllRanges();
-    const after = document.createRange();
-    after.selectNodeContents(span);
-    sel.addRange(after);
-    savedRange = after.cloneRange();
-    editor.focus();
+    let range = null;
+    if (sel.rangeCount && editor.contains(sel.getRangeAt(0).commonAncestorContainer)) {
+      range = sel.getRangeAt(0);
+    } else if (savedRange) range = savedRange;
+    if (!range) {
+      const end = readModel().length;
+      return { start: end, end };
+    }
+    const a = countBefore(range.startContainer, range.startOffset);
+    const b = countBefore(range.endContainer, range.endOffset);
+    return { start: Math.min(a, b), end: Math.max(a, b) };
   }
 
-  function insertAtCaret(node) {
-    let range = restoreRange();
-    if (!range || !editor.contains(range.commonAncestorContainer)) {
-      range = document.createRange();
-      range.selectNodeContents(editor);
-      range.collapse(false);
+  function pointAt(index) {
+    let remaining = index;
+    for (const node of editor.childNodes) {
+      if (node.nodeName === "BR" && node.dataset?.sentinel) continue;
+      const len = node.nodeName === "IMG" ? 1 : (node.textContent || "").length;
+      if (remaining <= len) {
+        if (node.nodeName === "IMG") {
+          return remaining === 0 ? { before: node } : { after: node };
+        }
+        const text = node.firstChild || node;
+        return { node: text, offset: remaining };
+      }
+      remaining -= len;
     }
-    range.deleteContents();
-    range.insertNode(node);
-    range.setStartAfter(node);
-    range.collapse(true);
+    return { end: true };
+  }
+
+  function setSelection(start, end = start) {
+    const range = document.createRange();
+    const place = (point, setter) => {
+      if (point.node) range[setter](point.node, point.offset);
+      else if (point.before) range[setter === "setStart" ? "setStartBefore" : "setEndBefore"](point.before);
+      else if (point.after) range[setter === "setStart" ? "setStartAfter" : "setEndAfter"](point.after);
+      else {
+        range[setter](editor, editor.childNodes.length);
+      }
+    };
+    place(pointAt(start), "setStart");
+    place(pointAt(end), "setEnd");
     const sel = window.getSelection();
     sel.removeAllRanges();
     sel.addRange(range);
     savedRange = range.cloneRange();
   }
 
-  // Editor DOM → spans. Inner styles win; "clear" resets everything.
+  function styleAt(model, index) {
+    for (let i = index - 1; i >= 0; i -= 1) {
+      if (!model[i].e) return cleanStyle(model[i].st);
+    }
+    return {};
+  }
+
+  // change(style, allHaveIt) -> new style
+  function applyStyle(change, toggleKey = null) {
+    showError(fxError, "");
+    const { start, end } = currentOffsets();
+    const model = readModel();
+    if (start === end) {
+      // Nothing selected: this becomes the style for what you type next.
+      const base = pending || styleAt(model, start);
+      const has = toggleKey ? Boolean(base[toggleKey]) : false;
+      pending = cleanStyle(change({ ...base }, has));
+      paintPending();
+      editor.focus();
+      setSelection(start);
+      return;
+    }
+    const chosen = model.slice(start, end).filter((item) => !item.e && item.t !== "\n");
+    const allHave = toggleKey ? chosen.length > 0 && chosen.every((item) => item.st?.[toggleKey]) : false;
+    for (let i = start; i < end; i += 1) {
+      if (model[i].e) continue;
+      model[i] = { t: model[i].t, st: cleanStyle(change({ ...cleanStyle(model[i].st) }, allHave)) };
+    }
+    pending = null;
+    paintPending();
+    renderModel(model);
+    editor.focus();
+    setSelection(start, end);
+  }
+
+  function paintPending() {
+    const note = document.getElementById("fx-pending");
+    if (!note) return;
+    if (!pending) {
+      note.hidden = true;
+      return;
+    }
+    note.hidden = false;
+    note.replaceChildren();
+    const sample = document.createElement("span");
+    sample.textContent = Object.keys(pending).length ? "Next text will look like this" : "Next text will be plain";
+    styleEditorSpan(sample, pending);
+    note.append(sample);
+  }
+
+  function insertItems(items) {
+    const { start, end } = currentOffsets();
+    const model = readModel();
+    model.splice(start, end - start, ...items);
+    renderModel(model);
+    editor.focus();
+    setSelection(start + items.length);
+  }
+
+  function insertText(text) {
+    const { start } = currentOffsets();
+    const model = readModel();
+    const st = pending || styleAt(model, start);
+    pending = null;
+    paintPending();
+    insertItems([...text].map((ch) => ({ t: ch, st: { ...st } })));
+  }
+
+  editor.addEventListener("beforeinput", (event) => {
+    if (event.inputType === "insertParagraph" || event.inputType === "insertLineBreak") {
+      event.preventDefault();
+      insertText("\n");
+    } else if (event.inputType === "insertText" && event.data) {
+      // We place typed text ourselves so it always gets the right style.
+      event.preventDefault();
+      insertText(event.data);
+    }
+  });
+
+  editor.addEventListener("compositionstart", () => {
+    editor.dataset.composing = "1";
+  });
+  editor.addEventListener("compositionend", () => {
+    delete editor.dataset.composing;
+    const { start, end } = currentOffsets();
+    renderModel(readModel());
+    setSelection(start, end);
+  });
+
+  editor.addEventListener("paste", (event) => {
+    event.preventDefault();
+    insertText(event.clipboardData.getData("text/plain").replace(/\r\n?/g, "\n"));
+  });
+
+  // Chrome sometimes wraps typed text in its own <font>/<div> tags; tidy up
+  // after each edit so the box always matches what will be sent.
+  editor.addEventListener("input", () => {
+    const stray =
+      editor.querySelector("font, div, p, b, i, u, strike, span:not([data-st])") ||
+      [...editor.childNodes].some((node) => node.nodeType === Node.TEXT_NODE);
+    if (!stray || editor.dataset.composing) return;
+    const { start, end } = currentOffsets();
+    renderModel(readModel());
+    setSelection(start, end);
+  });
+
+  function saveRange() {
+    const sel = window.getSelection();
+    if (!sel.rangeCount || !editor.contains(sel.anchorNode)) return;
+    const range = sel.getRangeAt(0).cloneRange();
+    if (savedRange && pending) {
+      // moving the caret somewhere else drops a pending style
+      const same =
+        range.collapsed &&
+        savedRange.collapsed &&
+        range.startContainer === savedRange.startContainer &&
+        range.startOffset === savedRange.startOffset;
+      if (!same) {
+        pending = null;
+        paintPending();
+      }
+    }
+    savedRange = range;
+  }
+
+  document.addEventListener("selectionchange", () => {
+    if (editorDialog.open) saveRange();
+  });
+
   function serialize() {
     const spans = [];
-    const push = (text, style) => {
-      if (!text) return;
+    for (const item of readModel()) {
+      if (item.e) {
+        spans.push({ e: item.e });
+        continue;
+      }
+      const st = cleanStyle(item.st);
       const last = spans[spans.length - 1];
-      const clean = {};
-      for (const [k, v] of Object.entries(style)) if (v !== undefined && v !== null && v !== false) clean[k] = v;
-      if (last && !last.e && JSON.stringify({ ...last, t: "" }) === JSON.stringify({ ...clean, t: "" })) {
-        last.t += text;
-      } else {
-        spans.push({ t: text, ...clean });
-      }
-    };
-    const walk = (node, style) => {
-      for (const child of node.childNodes) {
-        if (child.nodeType === Node.TEXT_NODE) {
-          push(child.nodeValue.replace(/ /g, " "), style);
-        } else if (child.nodeName === "BR") {
-          push("\n", style);
-        } else if (child.nodeName === "IMG" && child.dataset.emojiFile) {
-          spans.push({ e: { f: child.dataset.emojiFile, n: child.dataset.emojiName } });
-        } else if (child.nodeType === Node.ELEMENT_NODE) {
-          const d = child.dataset || {};
-          let next = { ...style };
-          if (d.clear) next = {};
-          if (d.b) next.b = 1;
-          if (d.i) next.i = 1;
-          if (d.u) next.u = 1;
-          if (d.s) next.s = 1;
-          if (d.w) next.w = 1;
-          if (d.sh) next.sh = 1;
-          if (d.gl) next.gl = 1;
-          if (d.sz) next.sz = Number(d.sz);
-          if (d.c) {
-            next.c = d.c;
-            delete next.g;
-            delete next.rb;
-          }
-          if (d.g) {
-            next.g = d.g.split(",");
-            delete next.c;
-            delete next.rb;
-          }
-          if (d.rb) {
-            next.rb = 1;
-            delete next.c;
-            delete next.g;
-          }
-          const block = child.nodeName === "DIV" || child.nodeName === "P";
-          if (block && spans.length) push("\n", {});
-          walk(child, next);
-        }
-      }
-    };
-    walk(editor, {});
-    // trim trailing newlines
-    while (spans.length && !spans[spans.length - 1].e && /^\s*$/.test(spans[spans.length - 1].t)) spans.pop();
+      if (last && !last.e && styleKey(last) === styleKey(st)) last.t += item.t;
+      else spans.push({ t: item.t, ...st });
+    }
+    while (spans.length && !spans[spans.length - 1].e && !spans[spans.length - 1].t.trim()) spans.pop();
+    while (spans.length && !spans[0].e && !spans[0].t.trim()) spans.shift();
     return spans;
   }
 
-  function renderStage() {
-    for (const node of [...stage.querySelectorAll(".stage-item")]) node.remove();
-    stage.querySelector(".stage-hint").hidden = overlays.length > 0;
+  const toggle = (key) => (st, allHave) => {
+    if (allHave) delete st[key];
+    else st[key] = 1;
+    if (key === "rb" && st.rb) {
+      delete st.c;
+      delete st.g;
+    }
+    return st;
+  };
+
+  document.getElementById("fx-toolbar").addEventListener("mousedown", (event) => {
+    // keep the text selection when clicking toolbar buttons
+    if (event.target.closest("button")) event.preventDefault();
+  });
+
+  document.getElementById("fx-toolbar").addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-cmd]");
+    if (!button) return;
+    const cmd = button.dataset.cmd;
+    if (cmd === "c") {
+      const color = document.getElementById("fx-color").value;
+      applyStyle((st) => ({ ...st, c: color, g: null, rb: null }));
+    } else if (cmd === "g") {
+      const colors = gradColors();
+      applyStyle((st) => ({ ...st, g: colors, c: null, rb: null }));
+    } else if (cmd === "clear") {
+      applyStyle(() => ({}));
+    } else {
+      applyStyle(toggle(cmd), cmd);
+    }
+  });
+
+  // Picking a color applies it straight away, like Google Docs.
+  document.getElementById("fx-color").addEventListener("change", (event) => {
+    const color = event.target.value;
+    applyStyle((st) => ({ ...st, c: color, g: null, rb: null }));
+  });
+
+  document.getElementById("fx-grad-count").addEventListener("change", renderGradInputs);
+
+  document.getElementById("fx-size").addEventListener("change", (event) => {
+    const value = Number(event.target.value);
+    event.target.value = "";
+    if (value) applyStyle((st) => ({ ...st, sz: value === 16 ? null : value }));
+  });
+
+  document.getElementById("fx-emoji").addEventListener("click", (event) => {
+    saveRange();
+    openPicker(event.currentTarget, (emoji) => {
+      insertItems([{ e: { f: emoji.fileId, n: emoji.name }, st: {} }]);
+    });
+  });
+
+  // ----- screen overlays: placed on the real screen -----
+  function renderOverlayThumbs() {
+    const list = document.getElementById("fx-overlay-list");
+    list.replaceChildren();
     for (const item of overlays) {
       const img = document.createElement("img");
-      img.className = "stage-item" + (item === selectedOverlay ? " selected" : "");
+      img.src = item.url;
+      img.alt = "";
+      img.title = `${item.s}s to ${item.e}s`;
+      list.append(img);
+    }
+    document.getElementById("fx-place").hidden = !overlays.length;
+    document.getElementById("fx-overlay-empty").hidden = overlays.length > 0;
+  }
+
+  let placer = null;
+
+  function openPlacer() {
+    stop();
+    editorDialog.close();
+    const el = layer();
+    el.hidden = false;
+    el.classList.add("show", "placing");
+    const frame = makeFrame();
+    frame.classList.add("placing-frame");
+    const label = document.createElement("div");
+    label.className = "frame-label";
+    label.textContent = "Phone screen: everything here is visible on every device";
+    frame.append(label);
+    el.append(frame);
+
+    const bar = document.createElement("div");
+    bar.className = "place-bar";
+    bar.innerHTML = `
+      <label class="btn ghost small file-btn">Add image / GIF<input type="file" accept="image/*" multiple hidden></label>
+      <span class="place-times">Show <input type="number" min="0" max="9.5" step="0.5" data-t="s">s → <input type="number" min="0.5" max="10" step="0.5" data-t="e">s</span>
+      <button type="button" class="btn ghost small" data-act="remove">Remove</button>
+      <button type="button" class="btn ghost small" data-act="preview">▶ Preview</button>
+      <button type="button" class="btn primary small" data-act="done">Done</button>`;
+    el.append(bar);
+    placer = { frame, bar };
+
+    bar.querySelector('input[type="file"]').addEventListener("change", (event) => {
+      addOverlayFiles([...(event.target.files || [])]);
+      event.target.value = "";
+      drawPlaced();
+    });
+    for (const input of bar.querySelectorAll("input[data-t]")) {
+      input.addEventListener("change", () => {
+        if (!selectedOverlay) return;
+        const s = Math.min(9.5, Math.max(0, Number(bar.querySelector('[data-t="s"]').value) || 0));
+        let e = Math.min(10, Math.max(0.5, Number(bar.querySelector('[data-t="e"]').value) || 10));
+        if (e <= s) e = Math.min(10, s + 0.5);
+        selectedOverlay.s = s;
+        selectedOverlay.e = e;
+        paintTimes();
+      });
+    }
+    bar.addEventListener("click", (event) => {
+      const act = event.target.closest("[data-act]")?.dataset.act;
+      if (act === "remove" && selectedOverlay) {
+        URL.revokeObjectURL(selectedOverlay.url);
+        overlays = overlays.filter((item) => item !== selectedOverlay);
+        selectedOverlay = overlays[overlays.length - 1] || null;
+        drawPlaced();
+      } else if (act === "preview") {
+        closePlacer(false);
+        try {
+          const { effect } = buildEffect(true);
+          if (effect) play(effect, (url) => url);
+          const wait = setInterval(() => {
+            if (!playing) {
+              clearInterval(wait);
+              openPlacer();
+            }
+          }, 200);
+        } catch (err) {
+          openPlacer();
+        }
+      } else if (act === "done") {
+        closePlacer(true);
+      }
+    });
+    drawPlaced();
+  }
+
+  function paintTimes() {
+    if (!placer) return;
+    const times = placer.bar.querySelector(".place-times");
+    times.style.visibility = selectedOverlay ? "visible" : "hidden";
+    if (selectedOverlay) {
+      times.querySelector('[data-t="s"]').value = selectedOverlay.s;
+      times.querySelector('[data-t="e"]').value = selectedOverlay.e;
+    }
+    placer.bar.querySelector('[data-act="remove"]').disabled = !selectedOverlay;
+  }
+
+  function drawPlaced() {
+    if (!placer) return;
+    const { frame } = placer;
+    for (const node of [...frame.querySelectorAll(".place-item")]) node.remove();
+    for (const item of overlays) {
+      const box = document.createElement("div");
+      box.className = "place-item" + (item === selectedOverlay ? " selected" : "");
+      placeOverlay(box, item);
+      const img = document.createElement("img");
       img.src = item.url;
       img.alt = "";
       img.draggable = false;
-      img.style.left = `${item.x}%`;
-      img.style.top = `${item.y}%`;
-      img.style.width = `${item.w}%`;
-      img.addEventListener("pointerdown", (event) => {
-        event.preventDefault();
-        selectOverlay(item);
-        const box = stage.getBoundingClientRect();
-        img.setPointerCapture?.(event.pointerId);
+      const rot = document.createElement("span");
+      rot.className = "h-rotate";
+      rot.title = "Drag to rotate";
+      const size = document.createElement("span");
+      size.className = "h-resize";
+      size.title = "Drag to resize";
+      box.append(img, rot, size);
+      frame.append(box);
+
+      const center = () => {
+        const r = frame.getBoundingClientRect();
+        return { x: r.left + (item.x / 100) * r.width, y: r.top + (item.y / 100) * r.height, r };
+      };
+      const drag = (startEvent, onMove) => {
+        startEvent.preventDefault();
+        startEvent.stopPropagation();
+        if (selectedOverlay !== item) {
+          selectedOverlay = item;
+          for (const node of frame.querySelectorAll(".place-item")) node.classList.remove("selected");
+          box.classList.add("selected");
+          paintTimes();
+        }
+        const target = startEvent.currentTarget;
+        target.setPointerCapture?.(startEvent.pointerId);
         const move = (ev) => {
-          item.x = Math.round(Math.min(100, Math.max(0, ((ev.clientX - box.left) / box.width) * 100)));
-          item.y = Math.round(Math.min(100, Math.max(0, ((ev.clientY - box.top) / box.height) * 100)));
-          img.style.left = `${item.x}%`;
-          img.style.top = `${item.y}%`;
+          onMove(ev);
+          placeOverlay(box, item);
         };
         const up = () => {
-          img.removeEventListener("pointermove", move);
-          img.removeEventListener("pointerup", up);
-          img.removeEventListener("pointercancel", up);
+          target.removeEventListener("pointermove", move);
+          target.removeEventListener("pointerup", up);
+          target.removeEventListener("pointercancel", up);
         };
-        img.addEventListener("pointermove", move);
-        img.addEventListener("pointerup", up);
-        img.addEventListener("pointercancel", up);
+        target.addEventListener("pointermove", move);
+        target.addEventListener("pointerup", up);
+        target.addEventListener("pointercancel", up);
+      };
+
+      box.addEventListener("pointerdown", (event) => {
+        const c = center();
+        const offX = event.clientX - c.x;
+        const offY = event.clientY - c.y;
+        drag(event, (ev) => {
+          item.x = Math.round(Math.min(100, Math.max(0, ((ev.clientX - offX - c.r.left) / c.r.width) * 100)) * 10) / 10;
+          item.y = Math.round(Math.min(100, Math.max(0, ((ev.clientY - offY - c.r.top) / c.r.height) * 100)) * 10) / 10;
+        });
       });
-      stage.append(img);
+      size.addEventListener("pointerdown", (event) => {
+        const c = center();
+        const startDist = Math.hypot(event.clientX - c.x, event.clientY - c.y) || 1;
+        const startW = item.w;
+        drag(event, (ev) => {
+          const dist = Math.hypot(ev.clientX - c.x, ev.clientY - c.y);
+          item.w = Math.round(Math.min(150, Math.max(4, (startW * dist) / startDist)));
+        });
+      });
+      rot.addEventListener("pointerdown", (event) => {
+        const c = center();
+        drag(event, (ev) => {
+          let angle = (Math.atan2(ev.clientY - c.y, ev.clientX - c.x) * 180) / Math.PI + 90;
+          if (angle > 180) angle -= 360;
+          if (Math.abs(angle) < 5) angle = 0;
+          item.r = Math.round(angle);
+        });
+      });
+    }
+    paintTimes();
+  }
+
+  function closePlacer(reopen) {
+    const el = layer();
+    el.classList.remove("placing", "show");
+    for (const node of [...el.querySelectorAll(".fx-frame, .place-bar")]) node.remove();
+    el.hidden = true;
+    placer = null;
+    if (reopen) {
+      renderOverlayThumbs();
+      editorDialog.showModal();
     }
   }
 
-  function selectOverlay(item) {
-    selectedOverlay = item;
-    const edit = document.getElementById("fx-overlay-edit");
-    edit.hidden = !item;
-    if (item) {
-      document.getElementById("fx-ov-size").value = item.w;
-      document.getElementById("fx-ov-size-val").textContent = `${item.w}% of screen width`;
-      document.getElementById("fx-ov-start").value = item.s;
-      document.getElementById("fx-ov-end").value = item.e;
+  function addOverlayFiles(files) {
+    for (const file of files) {
+      if (overlays.length >= 12) break;
+      const item = {
+        id: nextOverlayId++,
+        file,
+        url: URL.createObjectURL(file),
+        x: 50,
+        y: 45,
+        w: 60,
+        r: 0,
+        s: 0,
+        e: 5,
+      };
+      overlays.push(item);
+      selectedOverlay = item;
     }
-    for (const node of stage.querySelectorAll(".stage-item")) node.classList.remove("selected");
-    renderStage();
   }
 
+  document.getElementById("fx-overlay-input").addEventListener("change", (event) => {
+    const files = [...(event.target.files || [])];
+    event.target.value = "";
+    if (!files.length) return;
+    addOverlayFiles(files);
+    openPlacer();
+  });
+
+  document.getElementById("fx-place").addEventListener("click", () => {
+    if (!selectedOverlay) selectedOverlay = overlays[0] || null;
+    openPlacer();
+  });
+
+  // ----- music -----
   function musicKind() {
     return document.querySelector('input[name="fx-music"]:checked').value;
   }
@@ -860,6 +1317,8 @@ const Fx = (() => {
 
   function resetEditor() {
     editor.replaceChildren();
+    pending = null;
+    paintPending();
     for (const item of overlays) URL.revokeObjectURL(item.url);
     overlays = [];
     selectedOverlay = null;
@@ -870,27 +1329,28 @@ const Fx = (() => {
     document.getElementById("fx-music-end").value = "";
     document.getElementById("fx-music-vol").value = "0.8";
     document.querySelector('input[name="fx-music"][value="none"]').checked = true;
-    document.getElementById("fx-overlay-edit").hidden = true;
     paintMusicRows();
-    renderStage();
+    renderOverlayThumbs();
     showError(fxError, "");
   }
 
   function openEditor(initialText = "") {
     if (!activeId) return;
-    if (!editor.childNodes.length && initialText) editor.textContent = initialText;
-    const ratio = window.innerWidth / Math.max(1, window.innerHeight);
-    stage.style.aspectRatio = `${ratio}`;
+    if (!editor.childNodes.length && initialText) {
+      renderModel([...initialText].map((ch) => ({ t: ch, st: {} })));
+    }
     renderGradInputs();
-    renderStage();
+    renderOverlayThumbs();
     paintMusicRows();
+    paintPending();
     showError(fxError, "");
     if (!Emoji.loaded) Emoji.load();
     editorDialog.showModal();
     editor.focus();
+    setSelection(readModel().length);
   }
 
-  // Build the fx payload. assetUrl: true → local preview URLs, false → indices.
+  // Build the fx payload. forPreview: local URLs instead of upload indexes.
   function buildEffect(forPreview) {
     const effect = {};
     const files = [];
@@ -902,7 +1362,7 @@ const Fx = (() => {
           a = files.length;
           files.push(item.file);
         }
-        return { a, x: item.x, y: item.y, w: item.w, s: item.s, e: item.e };
+        return { a, x: item.x, y: item.y, w: item.w, r: item.r, s: item.s, e: item.e };
       });
     }
     const kind = musicKind();
@@ -930,97 +1390,6 @@ const Fx = (() => {
     }
     return { effect: effect.overlays || effect.music ? effect : null, files };
   }
-
-  document.getElementById("fx-toolbar").addEventListener("mousedown", (event) => {
-    // keep the text selection when clicking toolbar buttons
-    if (event.target.closest("button")) event.preventDefault();
-  });
-
-  document.getElementById("fx-toolbar").addEventListener("click", (event) => {
-    const button = event.target.closest("button[data-cmd]");
-    if (!button) return;
-    const cmd = button.dataset.cmd;
-    if (cmd === "c") applyStyle({ c: document.getElementById("fx-color").value });
-    else if (cmd === "g") applyStyle({ g: gradColors().join(",") });
-    else if (cmd === "clear") applyStyle({ clear: "1" });
-    else applyStyle({ [cmd]: "1" });
-  });
-
-  document.getElementById("fx-grad-count").addEventListener("change", renderGradInputs);
-
-  document.getElementById("fx-size").addEventListener("change", (event) => {
-    const value = event.target.value;
-    event.target.value = "";
-    if (value) applyStyle({ sz: value });
-  });
-
-  document.getElementById("fx-emoji").addEventListener("click", (event) => {
-    saveRange();
-    openPicker(event.currentTarget, (emoji) => {
-      const img = document.createElement("img");
-      img.className = "fx-emoji";
-      img.src = emoji.url;
-      img.alt = `:${emoji.name}:`;
-      img.dataset.emojiFile = emoji.fileId;
-      img.dataset.emojiName = emoji.name;
-      img.contentEditable = "false";
-      insertAtCaret(img);
-      editor.focus();
-    });
-  });
-
-  editor.addEventListener("paste", (event) => {
-    event.preventDefault();
-    const text = event.clipboardData.getData("text/plain");
-    insertAtCaret(document.createTextNode(text));
-  });
-
-  document.getElementById("fx-overlay-input").addEventListener("change", (event) => {
-    for (const file of [...(event.target.files || [])]) {
-      if (overlays.length >= 12) break;
-      const item = {
-        id: nextOverlayId++,
-        file,
-        url: URL.createObjectURL(file),
-        x: 50,
-        y: 50,
-        w: 30,
-        s: 0,
-        e: 5,
-      };
-      overlays.push(item);
-      selectedOverlay = item;
-    }
-    event.target.value = "";
-    selectOverlay(selectedOverlay);
-  });
-
-  document.getElementById("fx-ov-size").addEventListener("input", (event) => {
-    if (!selectedOverlay) return;
-    selectedOverlay.w = Number(event.target.value);
-    document.getElementById("fx-ov-size-val").textContent = `${selectedOverlay.w}% of screen width`;
-    renderStage();
-  });
-
-  document.getElementById("fx-ov-start").addEventListener("change", (event) => {
-    if (!selectedOverlay) return;
-    selectedOverlay.s = Math.min(9.5, Math.max(0, Number(event.target.value) || 0));
-    if (selectedOverlay.e <= selectedOverlay.s) selectedOverlay.e = Math.min(10, selectedOverlay.s + 0.5);
-    selectOverlay(selectedOverlay);
-  });
-
-  document.getElementById("fx-ov-end").addEventListener("change", (event) => {
-    if (!selectedOverlay) return;
-    selectedOverlay.e = Math.min(10, Math.max(selectedOverlay.s + 0.5, Number(event.target.value) || 0));
-    selectOverlay(selectedOverlay);
-  });
-
-  document.getElementById("fx-ov-remove").addEventListener("click", () => {
-    if (!selectedOverlay) return;
-    URL.revokeObjectURL(selectedOverlay.url);
-    overlays = overlays.filter((item) => item !== selectedOverlay);
-    selectOverlay(overlays[overlays.length - 1] || null);
-  });
 
   for (const radio of document.querySelectorAll('input[name="fx-music"]')) {
     radio.addEventListener("change", paintMusicRows);
@@ -1053,7 +1422,14 @@ const Fx = (() => {
         showError(fxError, "Add an image, GIF or music to preview a screen effect.");
         return;
       }
+      editorDialog.close();
       play(effect, (url) => url);
+      const wait = setInterval(() => {
+        if (!playing) {
+          clearInterval(wait);
+          if (!editorDialog.open) editorDialog.showModal();
+        }
+      }, 200);
     } catch (err) {
       showError(fxError, err.message);
     }
@@ -1062,13 +1438,12 @@ const Fx = (() => {
   document.getElementById("fx-send").addEventListener("click", async () => {
     showError(fxError, "");
     const button = document.getElementById("fx-send");
-    let payload;
     try {
       const spans = serialize();
       const { effect, files } = buildEffect(false);
-      payload = { fx: {}, files };
-      if (spans.length) payload.fx.spans = spans;
-      if (effect) payload.fx.effect = effect;
+      const fx = {};
+      if (spans.length) fx.spans = spans;
+      if (effect) fx.effect = effect;
       if (!spans.length && !effect) {
         showError(fxError, "Write something or add an effect first.");
         return;
@@ -1080,7 +1455,7 @@ const Fx = (() => {
       }
       button.disabled = true;
       button.textContent = "Sending…";
-      await sendFx(payload.fx, payload.files, plain);
+      await sendFx(fx, files, plain);
       stop();
       resetEditor();
       editorDialog.close();

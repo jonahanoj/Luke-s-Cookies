@@ -2004,3 +2004,175 @@ dialog p.field-label {
   width: auto;
   flex-shrink: 0;
 }
+
+/* ---------- effect frame + placing ---------- */
+.fx-frame {
+  position: absolute;
+}
+
+.fx-overlay {
+  transform: translate(-50%, -50%) rotate(var(--rot, 0deg)) scale(0.92);
+  max-height: none;
+}
+
+.fx-overlay.on {
+  transform: translate(-50%, -50%) rotate(var(--rot, 0deg)) scale(1);
+}
+
+.fx-layer.placing {
+  pointer-events: auto;
+  opacity: 1;
+  background: rgba(0, 0, 0, 0.55);
+}
+
+.fx-layer.placing .fx-skip {
+  display: none;
+}
+
+.placing-frame {
+  outline: 2px dashed rgba(255, 255, 255, 0.85);
+  outline-offset: -2px;
+  background: rgba(255, 255, 255, 0.06);
+  box-shadow: 0 0 0 100vmax rgba(0, 0, 0, 0.25);
+  overflow: visible;
+}
+
+.frame-label {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: max-content;
+  max-width: 90%;
+  text-align: center;
+  font-size: 12px;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.55);
+  padding: 4px 8px;
+  pointer-events: none;
+}
+
+.place-item {
+  position: absolute;
+  transform: translate(-50%, -50%) rotate(var(--rot, 0deg));
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.place-item img {
+  display: block;
+  width: 100%;
+  height: auto;
+  pointer-events: none;
+}
+
+.place-item.selected {
+  outline: 2px solid #fff;
+  outline-offset: 2px;
+}
+
+.h-rotate,
+.h-resize {
+  position: absolute;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: #fff;
+  border: 2px solid #222;
+  touch-action: none;
+  display: none;
+}
+
+.place-item.selected .h-rotate,
+.place-item.selected .h-resize {
+  display: block;
+}
+
+.h-rotate {
+  top: -38px;
+  left: 50%;
+  transform: translateX(-50%);
+  cursor: crosshair;
+}
+
+.h-rotate::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 20px;
+  width: 2px;
+  height: 16px;
+  background: #fff;
+  transform: translateX(-50%);
+}
+
+.h-resize {
+  right: -13px;
+  bottom: -13px;
+  cursor: nwse-resize;
+}
+
+.place-bar {
+  position: absolute;
+  left: 50%;
+  bottom: calc(12px + env(safe-area-inset-bottom));
+  transform: translateX(-50%);
+  width: max-content;
+  max-width: calc(100vw - 16px);
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: center;
+  gap: 6px;
+  padding: 8px;
+  background: var(--paper-solid);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
+  z-index: 2;
+}
+
+.place-bar .btn.primary {
+  width: auto;
+}
+
+.place-times {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+}
+
+.place-times input {
+  width: 56px;
+  margin: 0;
+  padding: 4px 6px;
+}
+
+.fx-overlay-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.fx-overlay-list img {
+  height: 44px;
+  width: auto;
+  max-width: 80px;
+  object-fit: contain;
+  border: 1px solid var(--line);
+}
+
+.fx-pending {
+  font-size: 13px;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-bottom: 0;
+  background: var(--paper-solid);
+}
+
+.ed-wiggle,
+.ed-shake {
+  white-space: pre;
+}
