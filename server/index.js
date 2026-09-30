@@ -77,6 +77,19 @@ import {
   migrateCopiedPacks,
   toggleReaction,
   countUserReactions,
+  setPollVote,
+  addView,
+  starsGivenOn,
+  starsReceived,
+  hasStarred,
+  giveStars,
+  setRead,
+  listReads,
+  setCrumbState,
+  dueScheduledMessages,
+  markDelivered,
+  hardDeleteMessage,
+  vanishMessage,
 } from "./db.js";
 import { sanitizeFx, spansToText, fxAssetIds } from "./fx.js";
 import { makeGifLoop } from "./gifloop.js";
@@ -176,6 +189,25 @@ function publicMessage(message, userId, blocked = null) {
       totalSize: 0,
     };
   }
+  // Self-destructed (for everyone), or already seen by this viewer.
+  const gone = message.fx?.gone || (message.fx?.boom && !mine && (message.views || []).includes(userId));
+  if (gone) {
+    return {
+      id: message.id,
+      gone: true,
+      mine,
+      username: message.sender_username || null,
+      nameColor: message.name_color || "#6e8070",
+      avatarUrl: avatarUrl(message.avatar_id),
+      body: "",
+      createdAt: message.created_at,
+      pinned: false,
+      attachments: [],
+      fx: null,
+      totalSize: 0,
+      reactions: [],
+    };
+  }
   if (!mine && blocked?.has(message.sender_id)) {
     return {
       id: message.id,
@@ -224,7 +256,78 @@ function publicMessage(message, userId, blocked = null) {
     forwarded: Boolean(message.forwarded),
     reactions: groupReactions(message.reactions, userId),
     totalSize: all.reduce((sum, file) => sum + file.size, 0),
+    reply: message.reply || null,
+    scheduledFor: message.scheduled_for || null,
+    poll: publicPoll(message, userId),
+    stars: publicStars(message, userId),
+    boomSeen: message.fx?.boom ? (message.views || []).length : undefined,
+    crumbState: message.fx?.crumb
+      ? message.crumb_state || globalThis.CrumbsEngine.initialState(message.fx.crumb, Date.parse(message.created_at))
+      : undefined,
+    serverNow: message.fx?.crumb ? Date.now() : undefined,
   };
+}
+
+function publicPoll(message, userId) {
+  const poll = message.fx?.poll;
+  if (!poll) return undefined;
+  const votes = message.votes || [];
+  return {
+    q: poll.q,
+    multi: poll.multi,
+    anon: poll.anon,
+    total: new Set(votes.map((v) => v.u)).size,
+    options: poll.options.map((text, index) => {
+      const here = votes.filter((v) => v.o === index);
+      return {
+        text,
+        count: here.length,
+        mine: here.some((v) => v.u === userId),
+        voters: poll.anon ? [] : here.map((v) => v.n).filter(Boolean),
+      };
+    }),
+  };
+}
+
+function publicStars(message, userId) {
+  const list = message.stars || [];
+  if (!list.length) return { total: 0, mine: 0, givers: [] };
+  return {
+    total: list.reduce((sum, g) => sum + g.s, 0),
+    mine: list.find((g) => g.u === userId)?.s || 0,
+    givers: list.map((g) => ({ name: g.n, stars: g.s })),
+  };
+}
+
+// Short preview of the message being replied to.
+function replySnippet(message) {
+  if (!message) return { gone: true, snippet: "Message is gone" };
+  if (message.deleted) return { id: message.id, gone: true, snippet: "Deleted message" };
+  if (message.fx?.gone || message.fx?.boom) return { id: message.id, username: message.sender_username, snippet: "💣 Self-destructing message" };
+  let snippet = message.body || "";
+  if (!snippet) {
+    const files = (message.attachments || []).filter((f) => f.role !== "fx");
+    if (message.fx?.poll) snippet = `📊 ${message.fx.poll.q}`;
+    else if (message.fx?.crumb) snippet = "🍪 Crumb";
+    else if (files.length) snippet = files.length === 1 ? files[0].name : `${files.length} files`;
+    else if (message.fx?.effect) snippet = "✨ Effect";
+    else snippet = "Message";
+  }
+  return {
+    id: message.id,
+    username: message.sender_username || null,
+    snippet: snippet.length > 120 ? `${snippet.slice(0, 119)}…` : snippet,
+  };
+}
+
+async function attachReplies(messages) {
+  const byId = new Map(messages.map((m) => [m.id, m]));
+  for (const message of messages) {
+    if (!message.reply_to) continue;
+    const target = byId.get(message.reply_to) || (await getMessage(message.reply_to));
+    message.reply = replySnippet(target);
+  }
+  return messages;
 }
 
 function signToken(userId) {
@@ -567,6 +670,7 @@ app.get("/api/users/:username/profile", requireUser, async (req, res) => {
       avatarUrl: avatarUrl(user.avatar_id),
       nameColor: user.name_color || "#6e8070",
       bio: user.bio || "",
+      stars: await starsReceived(user.id),
       isMe: user.id === req.user.id,
       blocked: blocked.has(user.id),
     },
@@ -1210,12 +1314,28 @@ app.get("/api/conversations/:id/messages", requireUser, async (req, res) => {
     res.status(404).json({ error: "Chat not found." });
     return;
   }
-  const messages = await listMessages(conversation.id);
+  const messages = await attachReplies(await listMessages(conversation.id, req.user.id));
   const blocked = await blockedIdsBy(req.user.id);
+  const reads = (await listReads(conversation.id))
+    .filter((r) => r.user_id !== req.user.id)
+    .map((r) => ({ username: r.username, avatarUrl: avatarUrl(r.avatar_id), at: r.read_at }));
   res.json({
     messages: messages.map((message) => publicMessage(message, req.user.id, blocked)),
+    reads,
   });
 });
+
+// Sends a new message out to everyone in the chat (live + notifications).
+async function deliverMessage(conversation, message) {
+  const blockers = await blockerIdsOf(message.sender_id);
+  emitToConversation(conversation, "message", (userId) => ({
+    conversationId: conversation.id,
+    ...publicMessage(message, userId, blockers.has(userId) ? new Set([message.sender_id]) : null),
+  }));
+  notifyMembers(conversation, message, blockers).catch((err) =>
+    console.warn("Notify failed:", err.message)
+  );
+}
 
 app.post(
   "/api/conversations/:id/messages",
@@ -1229,12 +1349,23 @@ app.post(
     const fxFiles = req.files?.fxfiles || [];
     const files = [...plainFiles, ...fxFiles];
     let fx = null;
+    const extraFx = []; // server-made fx assets (e.g. a copy of your theme background)
     if (req.body.fx) {
       try {
-        fx = sanitizeFx(
-          JSON.parse(String(req.body.fx)),
-          fxFiles.map((file) => file.filename)
-        );
+        const raw = JSON.parse(String(req.body.fx));
+        const assetIds = fxFiles.map((file) => file.filename);
+        if (raw?.theme && raw.theme.bg === "mine") {
+          delete raw.theme.bg;
+          const copy = req.user.theme_bg_id ? duplicateUpload(req.user.theme_bg_id) : null;
+          if (copy) {
+            const size = fs.statSync(attachmentPath(copy)).size;
+            extraFx.push({ id: copy, name: "theme-background.webp", mime: "image/webp", size, role: "fx" });
+            assetIds.push(copy);
+            raw.theme.bg = assetIds.length - 1;
+          }
+        }
+        delete raw?.roulette;
+        fx = sanitizeFx(raw, assetIds);
       } catch {
         fx = null;
       }
@@ -1243,6 +1374,28 @@ app.post(
     const usedFx = fxAssetIds(fx);
     const keptFx = fxFiles.filter((file) => usedFx.has(file.filename));
     removeFiles(fxFiles.filter((file) => !usedFx.has(file.filename)));
+    for (const extra of extraFx.filter((file) => !usedFx.has(file.id))) deleteUpload(extra.id);
+    // Replying and scheduling.
+    let replyTo = null;
+    if (req.body.replyTo) {
+      const target = await getMessage(String(req.body.replyTo));
+      if (target && target.conversation_id === req.params.id) replyTo = target.id;
+    }
+    let scheduledFor = null;
+    if (req.body.scheduledFor) {
+      const when = new Date(String(req.body.scheduledFor));
+      if (Number.isNaN(when.getTime()) || when.getTime() < Date.now() + 30 * 1000) {
+        removeFiles([...plainFiles, ...keptFx]);
+        res.status(400).json({ error: "Pick a time at least a minute from now." });
+        return;
+      }
+      if (when.getTime() > Date.now() + 366 * 24 * 60 * 60 * 1000) {
+        removeFiles([...plainFiles, ...keptFx]);
+        res.status(400).json({ error: "You can schedule up to a year ahead." });
+        return;
+      }
+      scheduledFor = when.toISOString();
+    }
     let body = String(req.body.body || "").trim();
     if (fx?.spans) body = spansToText(fx.spans).trim();
     if (body.length > 2000) body = body.slice(0, 2000);
@@ -1290,26 +1443,27 @@ app.post(
     const attachments = [
       ...plainFiles.map(toAttachment("file")),
       ...keptFx.map(toAttachment("fx")),
+      ...extraFx.filter((file) => usedFx.has(file.id)),
     ];
     for (const file of attachments) {
       if (file.mime === "image/gif") makeGifLoop(attachmentPath(file.id));
     }
-    const message = await addMessage(
-      conversation.id,
-      req.user.id,
-      body,
-      attachments,
-      fx
-    );
-    const blockers = await blockerIdsOf(req.user.id);
-    emitToConversation(conversation, "message", (userId) => ({
-      conversationId: conversation.id,
-      ...publicMessage(message, userId, blockers.has(userId) ? new Set([req.user.id]) : null),
-    }));
+    const message = await addMessage(conversation.id, req.user.id, body, attachments, fx, false, {
+      replyTo,
+      scheduledFor,
+    });
+    if (fx?.crumb) {
+      message.crumb_state = globalThis.CrumbsEngine.initialState(fx.crumb);
+      await setCrumbState(message.id, message.crumb_state);
+    }
+    await attachReplies([message]);
+    if (scheduledFor) {
+      // Only the sender sees it until it's delivered.
+      res.status(201).json(publicMessage(message, req.user.id));
+      return;
+    }
+    await deliverMessage(conversation, message);
     res.status(201).json(publicMessage(message, req.user.id));
-    notifyMembers(conversation, message, blockers).catch((err) =>
-      console.warn("Notify failed:", err.message)
-    );
   }
 );
 
@@ -1334,6 +1488,14 @@ async function ownMessage(req, res) {
 }
 
 async function emitMessageUpdated(conversation, updated) {
+  await attachReplies([updated]);
+  if (updated.scheduled_for) {
+    io.to(updated.sender_id).emit("message-updated", {
+      conversationId: conversation.id,
+      ...publicMessage(updated, updated.sender_id),
+    });
+    return;
+  }
   const blockers = await blockerIdsOf(updated.sender_id);
   emitToConversation(conversation, "message-updated", (userId) => ({
     conversationId: conversation.id,
@@ -1350,6 +1512,11 @@ app.patch(
     const { message, conversation } = await ownMessage(req, res);
     if (!message) {
       removeFiles(fxFiles);
+      return;
+    }
+    if (message.fx?.poll || message.fx?.crumb || message.fx?.roulette || message.fx?.theme || message.fx?.pack) {
+      removeFiles(fxFiles);
+      res.status(400).json({ error: "This kind of message can't be edited." });
       return;
     }
     const existing = new Set(
@@ -1396,6 +1563,13 @@ app.patch(
 app.delete("/api/messages/:id", requireUser, async (req, res) => {
   const { message, conversation } = await ownMessage(req, res);
   if (!message) return;
+  if (message.scheduled_for) {
+    // Cancelling a scheduled message: nobody else ever saw it.
+    await hardDeleteMessage(message.id);
+    io.to(req.user.id).emit("message-removed", { conversationId: conversation.id, id: message.id });
+    res.json({ id: message.id, removed: true });
+    return;
+  }
   const updated = await deleteMessageContent(message.id);
   await emitMessageUpdated(conversation, updated);
   emitToConversation(conversation, "username-changed", () => ({}));
@@ -1464,20 +1638,20 @@ app.post("/api/messages/:id/forward", requireUser, async (req, res) => {
       idMap.set(file.id, newId);
       attachments.push({ ...file, id: newId, role: file.role === "fx" ? "fx" : "file" });
     }
-    let fx = message.fx ? JSON.parse(JSON.stringify(message.fx)) : null;
-    if (fx?.effect) {
-      fx.effect.overlays = (fx.effect.overlays || [])
-        .filter((o) => idMap.has(o.a))
-        .map((o) => ({ ...o, a: idMap.get(o.a) }));
-      if (!fx.effect.overlays.length) delete fx.effect.overlays;
-      if (fx.effect.music?.a) {
-        if (idMap.has(fx.effect.music.a)) fx.effect.music.a = idMap.get(fx.effect.music.a);
-        else delete fx.effect.music;
-      }
-      if (!fx.effect.overlays && !fx.effect.music) delete fx.effect;
+    // Point the copy's effect/crumb/theme at the copied files.
+    let fxText = message.fx ? JSON.stringify(message.fx) : null;
+    for (const [oldId, newId] of idMap) if (fxText) fxText = fxText.split(oldId).join(newId);
+    let fx = fxText ? JSON.parse(fxText) : null;
+    if (fx) {
+      delete fx.gone;
+      delete fx.roulette;
     }
     if (fx && !Object.keys(fx).length) fx = null;
     const copy = await addMessage(conversation.id, req.user.id, message.body || "", attachments, fx, true);
+    if (fx?.crumb) {
+      copy.crumb_state = globalThis.CrumbsEngine.initialState(fx.crumb);
+      await setCrumbState(copy.id, copy.crumb_state);
+    }
     const copyBlockers = await blockerIdsOf(req.user.id);
     emitToConversation(conversation, "message", (userId) => ({
       conversationId: conversation.id,
@@ -1518,6 +1692,216 @@ app.post("/api/messages/:id/react", requireUser, async (req, res) => {
   const updated = await getMessage(message.id);
   await emitMessageUpdated(conversation, updated);
   res.json(publicMessage(updated, req.user.id));
+});
+
+// ---- helpers for message actions ----
+async function memberMessage(req, res) {
+  const message = await getMessage(req.params.id);
+  const conversation = message ? await userInConversation(message.conversation_id, req.user.id) : null;
+  if (!message || !conversation || message.deleted || message.fx?.gone) {
+    res.status(404).json({ error: "Message not found." });
+    return {};
+  }
+  if (message.scheduled_for && message.sender_id !== req.user.id) {
+    res.status(404).json({ error: "Message not found." });
+    return {};
+  }
+  return { message, conversation };
+}
+
+// ---- polls ----
+app.post("/api/messages/:id/vote", requireUser, async (req, res) => {
+  const { message, conversation } = await memberMessage(req, res);
+  if (!message) return;
+  const poll = message.fx?.poll;
+  const option = Number(req.body.option);
+  if (!poll || !Number.isInteger(option) || option < 0 || option >= poll.options.length) {
+    res.status(400).json({ error: "That's not a poll option." });
+    return;
+  }
+  await setPollVote(message.id, req.user.id, option, poll.multi);
+  const updated = await getMessage(message.id);
+  await emitMessageUpdated(conversation, updated);
+  res.json(publicMessage(updated, req.user.id));
+});
+
+// ---- self-destructing messages ----
+app.post("/api/messages/:id/viewed", requireUser, async (req, res) => {
+  const { message, conversation } = await memberMessage(req, res);
+  if (!message) return;
+  if (!message.fx?.boom || message.sender_id === req.user.id) {
+    res.json({ ok: true });
+    return;
+  }
+  await addView(message.id, req.user.id);
+  const updated = await getMessage(message.id);
+  const recipients = conversation.member_ids.filter((id) => id !== message.sender_id);
+  const seenAll = recipients.every((id) => (updated.views || []).includes(id));
+  // Give the viewer time to watch it before the files disappear.
+  const finish = async () => {
+    if (seenAll) await vanishMessage(message.id);
+    const latest = await getMessage(message.id);
+    if (latest) await emitMessageUpdated(conversation, latest);
+  };
+  setTimeout(() => finish().catch(() => {}), (message.fx.boom.secs + 4) * 1000);
+  res.json({ ok: true });
+});
+
+// ---- stars ----
+const STAR_DAILY = 10;
+function starDay(date = new Date()) {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: process.env.WIPE_TIMEZONE || "America/New_York" }).format(date);
+}
+
+app.get("/api/stars/me", requireUser, async (req, res) => {
+  const used = await starsGivenOn(req.user.id, starDay());
+  res.json({ remaining: Math.max(0, STAR_DAILY - used), daily: STAR_DAILY, received: await starsReceived(req.user.id) });
+});
+
+app.post("/api/messages/:id/stars", requireUser, async (req, res) => {
+  const { message, conversation } = await memberMessage(req, res);
+  if (!message) return;
+  const stars = Math.round(Number(req.body.stars));
+  if (message.sender_id === req.user.id) {
+    res.status(400).json({ error: "You can't star your own message." });
+    return;
+  }
+  if (!Number.isInteger(stars) || stars < 1 || stars > 10) {
+    res.status(400).json({ error: "Pick 1 to 10 stars." });
+    return;
+  }
+  if (await hasStarred(message.id, req.user.id)) {
+    res.status(400).json({ error: "You already rated this message." });
+    return;
+  }
+  const day = starDay();
+  const remaining = STAR_DAILY - (await starsGivenOn(req.user.id, day));
+  if (stars > remaining) {
+    res.status(400).json({ error: `You only have ${Math.max(0, remaining)} stars left today.` });
+    return;
+  }
+  await giveStars(message.id, req.user.id, message.sender_id, stars, day);
+  const updated = await getMessage(message.id);
+  await emitMessageUpdated(conversation, updated);
+  io.to(message.sender_id).emit("stars-received", { stars, from: req.user.username });
+  res.json({ message: publicMessage(updated, req.user.id), remaining: remaining - stars });
+});
+
+// ---- themes shared in chat ----
+app.post("/api/messages/:id/apply-theme", requireUser, async (req, res) => {
+  const { message } = await memberMessage(req, res);
+  if (!message) return;
+  const theme = message.fx?.theme;
+  if (!theme) {
+    res.status(400).json({ error: "That message has no theme." });
+    return;
+  }
+  let user = await setThemeColors(req.user.id, theme.p, theme.s);
+  if (theme.bg) {
+    const copy = duplicateUpload(theme.bg);
+    if (copy) {
+      const previous = req.user.theme_bg_id;
+      user = await setThemeBackground(req.user.id, copy);
+      if (previous && previous !== copy) deleteUpload(previous);
+    }
+  } else if (req.body.clearBackground && req.user.theme_bg_id) {
+    const previous = req.user.theme_bg_id;
+    user = await setThemeBackground(req.user.id, null);
+    deleteUpload(previous);
+  }
+  res.json({ user: publicUser(user) });
+});
+
+// ---- crumbs (interactive cards) ----
+const crumbLocks = new Map();
+app.post("/api/messages/:id/crumb", requireUser, async (req, res) => {
+  const { message, conversation } = await memberMessage(req, res);
+  if (!message) return;
+  const def = message.fx?.crumb;
+  if (!def) {
+    res.status(400).json({ error: "That message isn't a crumb." });
+    return;
+  }
+  const event = req.body.event || {};
+  if (!["press", "tick"].includes(event.type)) {
+    res.status(400).json({ error: "Unknown action." });
+    return;
+  }
+  // One change at a time per crumb so nobody's press gets lost.
+  const previous = crumbLocks.get(message.id) || Promise.resolve();
+  const job = previous.then(async () => {
+    const latest = await getMessage(message.id);
+    const current = latest.crumb_state || globalThis.CrumbsEngine.initialState(def, Date.parse(latest.created_at));
+    const result = globalThis.CrumbsEngine.apply(def, current, { type: event.type, el: String(event.el || "") }, Date.now());
+    if (result.changed) await setCrumbState(message.id, result.state);
+    return result;
+  });
+  crumbLocks.set(message.id, job.catch(() => {}));
+  const result = await job;
+  const payload = {
+    conversationId: conversation.id,
+    messageId: message.id,
+    state: result.state,
+    fired: result.fired,
+    by: req.user.username,
+    serverNow: Date.now(),
+  };
+  if (result.changed) emitToConversation(conversation, "crumb", () => payload);
+  res.json(payload);
+});
+
+// ---- read receipts ----
+app.post("/api/conversations/:id/read", requireUser, async (req, res) => {
+  const conversation = await userInConversation(req.params.id, req.user.id);
+  if (!conversation) {
+    res.status(404).json({ error: "Chat not found." });
+    return;
+  }
+  const at = new Date(String(req.body.at || ""));
+  if (Number.isNaN(at.getTime())) {
+    res.status(400).json({ error: "Bad time." });
+    return;
+  }
+  const readAt = new Date(Math.min(at.getTime(), Date.now())).toISOString();
+  await setRead(conversation.id, req.user.id, readAt);
+  emitToConversation(conversation, "read", () => ({
+    conversationId: conversation.id,
+    username: req.user.username,
+    avatarUrl: avatarUrl(req.user.avatar_id),
+    at: readAt,
+  }));
+  res.json({ ok: true });
+});
+
+// ---- group roulette ----
+app.post("/api/conversations/:id/roulette", requireUser, async (req, res) => {
+  const conversation = await userInConversation(req.params.id, req.user.id);
+  if (!conversation || conversation.type !== "group") {
+    res.status(404).json({ error: "Group not found." });
+    return;
+  }
+  const members = await listMemberProfiles(conversation.id);
+  if (members.length < 2) {
+    res.status(400).json({ error: "Need at least two people." });
+    return;
+  }
+  const winner = members[crypto.randomInt(members.length)];
+  const fx = {
+    roulette: {
+      names: members.map((m) => m.username),
+      colors: members.map((m) => m.name_color || "#6e8070"),
+      winner: winner.username,
+    },
+  };
+  const message = await addMessage(
+    conversation.id,
+    req.user.id,
+    `🎲 Roulette picked ${winner.username}`,
+    [],
+    fx
+  );
+  await deliverMessage(conversation, message);
+  res.status(201).json(publicMessage(message, req.user.id));
 });
 
 app.post("/api/messages/:id/pin", requireUser, async (req, res) => {
@@ -1653,6 +2037,24 @@ io.on("connection", (socket) => {
   socket.join(socket.userId);
   socket.data.visible = false;
   socket.data.conversationId = null;
+  // "Someone is typing": only relayed to people in that chat.
+  const typingOk = new Map();
+  socket.on("typing", async (payload) => {
+    const conversationId = typeof payload?.conversationId === "string" ? payload.conversationId : null;
+    if (!conversationId) return;
+    let entry = typingOk.get(conversationId);
+    if (!entry || entry.until < Date.now()) {
+      const conversation = await userInConversation(conversationId, socket.userId).catch(() => null);
+      const user = conversation ? await findUserById(socket.userId) : null;
+      entry = { conversation, username: user?.username, until: Date.now() + 60 * 1000 };
+      typingOk.set(conversationId, entry);
+    }
+    if (!entry.conversation) return;
+    for (const id of entry.conversation.member_ids || []) {
+      if (id === socket.userId) continue;
+      io.to(id).emit("typing", { conversationId, username: entry.username });
+    }
+  });
   socket.on("presence", (state) => {
     socket.data.visible = Boolean(state?.visible);
     socket.data.conversationId =
@@ -1681,6 +2083,21 @@ async function runWipe() {
 
 await initDb();
 await initPush();
+
+// Scheduled messages go out when their time comes.
+async function deliverScheduled() {
+  const due = await dueScheduledMessages();
+  for (const id of due) {
+    await markDelivered(id);
+    const message = await getMessage(id);
+    if (!message) continue;
+    const conversation = await userInConversation(message.conversation_id, message.sender_id);
+    if (!conversation) continue;
+    await attachReplies([message]);
+    await deliverMessage(conversation, message);
+  }
+}
+setInterval(() => deliverScheduled().catch((err) => console.warn("Scheduled send failed:", err.message)), 10 * 1000);
 try {
   const moved = await migrateCopiedPacks();
   if (moved) console.log(`Linked ${moved} copied emoji packs back to their creators.`);

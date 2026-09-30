@@ -117,14 +117,29 @@
           </div>
           <div id="file-preview" class="file-preview" hidden></div>
           <p id="compose-error" class="error compose-error" hidden></p>
+          <div id="typing-line" class="typing-line" hidden></div>
+          <div id="reply-bar" class="compose-bar" hidden>
+            <span class="bar-label">Replying to <b id="reply-who"></b>: <span id="reply-snippet"></span></span>
+            <button id="reply-cancel" class="bar-x" type="button" aria-label="Cancel reply">×</button>
+          </div>
+          <div id="schedule-bar" class="compose-bar" hidden>
+            <span class="bar-label">⏰ Next message sends <b id="schedule-when"></b></span>
+            <button id="schedule-cancel" class="bar-x" type="button" aria-label="Cancel schedule">×</button>
+          </div>
+          <div id="record-bar" class="record-bar" hidden>
+            <span class="rec-dot"></span>
+            <span id="record-time">0:00</span>
+            <span class="rec-label">Recording…</span>
+            <button id="record-cancel" class="btn ghost small" type="button">Cancel</button>
+            <button id="record-send" class="btn primary small" type="button">Send</button>
+          </div>
           <form id="compose" class="compose">
-            <label class="attach-btn" title="Attach files">
-              +
-              <input id="file-input" type="file" multiple />
-            </label>
+            <button id="plus-btn" class="attach-btn" type="button" title="Add: file, poll, drawing, crumb…">+</button>
+            <input id="file-input" type="file" multiple hidden />
             <button id="emoji-btn" class="icon-btn" type="button" title="Emojis">☺</button>
             <button id="fx-btn" class="icon-btn fx-btn" type="button" title="Fancy message: styles, screen effects, music">✨</button>
             <input id="compose-input" placeholder="Message" maxlength="2000" autocomplete="off" />
+            <button id="mic-btn" class="icon-btn" type="button" title="Record a voice message">🎤</button>
             <button class="btn primary" type="submit">Send</button>
           </form>
         </section>
@@ -166,6 +181,7 @@
         <button id="profile-close" class="icon-close" type="button" aria-label="Close">×</button>
         <img id="profile-avatar" class="profile-avatar" src="/assets/SmallLogo.png" alt="" />
         <h2 id="profile-name"></h2>
+        <div id="profile-stars" class="profile-stars"></div>
         <div class="bio-label">About me</div>
         <div id="profile-bio" class="profile-bio"></div>
         <div class="profile-actions">
@@ -353,7 +369,7 @@
         <div id="fx-editor" class="fx-editor" contenteditable="true" spellcheck="true" data-placeholder="Type, select some text, then pick a style…"></div>
 
         <section class="fx-section">
-          <h3>Screen effect <span class="hint-inline">plays once when they open the chat, up to 10 seconds</span></h3>
+          <h3>Screen effect <span class="hint-inline">plays once when they open the chat · they can skip it</span></h3>
           <div class="fx-row">
             <div id="fx-overlay-list" class="fx-overlay-list"></div>
             <span id="fx-overlay-empty" class="hint-inline">No images yet.</span>
@@ -368,7 +384,7 @@
         </section>
 
         <section class="fx-section">
-          <h3>Music <span class="hint-inline">up to 10 seconds</span></h3>
+          <h3>Music <span class="hint-inline">any length (10s if you leave End empty)</span></h3>
           <div class="fx-row music-kind">
             <label><input type="radio" name="fx-music" value="none" checked /> None</label>
             <label><input type="radio" name="fx-music" value="file" /> MP3 / audio file</label>
@@ -388,6 +404,41 @@
             <label>Start <input id="fx-music-start" placeholder="0:00" /></label>
             <label>End <input id="fx-music-end" placeholder="0:10" /></label>
             <label>Volume <input id="fx-music-vol" type="range" min="0" max="1" step="0.05" value="0.8" /></label>
+          </div>
+        </section>
+
+        <section class="fx-section">
+          <h3>Whole screen <span class="hint-inline">moves or recolors their screen</span></h3>
+          <div id="fx-screen-list" class="fx-screen-list"></div>
+          <div class="fx-row">
+            <select id="fx-screen-kind" aria-label="Screen effect">
+              <option value="shake">Shake</option>
+              <option value="flip">Upside down</option>
+              <option value="mirror">Mirror</option>
+              <option value="spin">Spin</option>
+              <option value="wobble">Wobble</option>
+              <option value="tilt">Tilt</option>
+              <option value="zoom">Zoom pulse</option>
+              <option value="invert">Invert colors</option>
+              <option value="rainbow">Rainbow</option>
+              <option value="grayscale">Black &amp; white</option>
+            </select>
+            <label>from <input id="fx-screen-s" type="number" min="0" step="0.5" value="0" />s</label>
+            <label>to <input id="fx-screen-e" type="number" min="0.5" step="0.5" value="3" />s</label>
+            <button id="fx-screen-add" class="btn ghost small" type="button">Add</button>
+          </div>
+        </section>
+
+        <section class="fx-section">
+          <h3>Self-destruct <span class="hint-inline">disappears after they see it</span></h3>
+          <div class="fx-row">
+            <select id="fx-boom-style" aria-label="Self-destruct style">
+              <option value="">Off</option>
+              <option value="crumble">Crumble</option>
+              <option value="melt">Melt</option>
+              <option value="explode">Explode</option>
+            </select>
+            <label>Visible for <input id="fx-boom-secs" type="number" min="1" max="60" value="5" />s</label>
           </div>
         </section>
 
@@ -419,6 +470,141 @@
       </form>
     </dialog>
 
+
+    <!-- "+" menu -->
+    <div id="plus-menu" class="pop-menu" hidden>
+      <button type="button" data-act="file">📎 File</button>
+      <button type="button" data-act="poll">📊 Poll</button>
+      <button type="button" data-act="draw">🖌️ Drawing</button>
+      <button type="button" data-act="crumb">🍪 Crumb (interactive)</button>
+      <button type="button" data-act="boom">💣 Self-destructing message</button>
+      <button type="button" data-act="schedule">⏰ Schedule next message</button>
+      <button type="button" data-act="theme">🎨 Send my theme</button>
+      <button type="button" data-act="roulette" class="group-only">🎲 Roulette</button>
+    </div>
+
+    <!-- Message "⋯" menu -->
+    <div id="msg-menu" class="pop-menu" hidden></div>
+
+    <!-- Star rating -->
+    <div id="star-pop" class="pop-menu star-pop" hidden>
+      <div class="star-row" id="star-row"></div>
+      <div class="star-note" id="star-note"></div>
+    </div>
+
+    <!-- Poll maker -->
+    <dialog id="poll-dialog">
+      <form method="dialog" id="poll-form">
+        <h2>New poll</h2>
+        <label>Question <input id="poll-q" maxlength="200" required /></label>
+        <div id="poll-options" class="poll-options"></div>
+        <button id="poll-add" class="btn ghost small" type="button">+ Add option</button>
+        <label class="switch-row"><input id="poll-multi" type="checkbox" /> <span>Allow picking more than one</span></label>
+        <label class="switch-row"><input id="poll-anon" type="checkbox" /> <span>Anonymous (hide who voted)</span></label>
+        <p id="poll-error" class="error" hidden></p>
+        <div class="dialog-actions">
+          <button class="btn ghost" value="cancel" type="submit">Cancel</button>
+          <button id="poll-send" class="btn primary" type="button">Send poll</button>
+        </div>
+      </form>
+    </dialog>
+
+    <!-- Schedule -->
+    <dialog id="schedule-dialog">
+      <form method="dialog">
+        <h2>Schedule next message</h2>
+        <p>Your next message (text, fancy message, poll, drawing…) waits and sends at this time.</p>
+        <label>Send at <input id="schedule-input" type="datetime-local" /></label>
+        <p id="schedule-error" class="error" hidden></p>
+        <div class="dialog-actions">
+          <button class="btn ghost" value="cancel" type="submit">Cancel</button>
+          <button id="schedule-set" class="btn primary" type="button">Set time</button>
+        </div>
+      </form>
+    </dialog>
+
+    <!-- Drawing pad -->
+    <dialog id="draw-dialog" class="draw-dialog">
+      <div class="draw-wrap">
+        <div class="draw-tools">
+          <input id="draw-color" type="color" value="#222222" title="Color" />
+          <input id="draw-size" type="range" min="1" max="60" value="6" title="Brush size" />
+          <button id="draw-pen" class="btn ghost small active" type="button">Pen</button>
+          <button id="draw-eraser" class="btn ghost small" type="button">Eraser</button>
+          <button id="draw-undo" class="btn ghost small" type="button">Undo</button>
+          <button id="draw-clear" class="btn ghost small" type="button">Clear</button>
+          <label class="switch-row small-switch"><input id="draw-clearbg" type="checkbox" /> <span>See-through</span></label>
+        </div>
+        <canvas id="draw-canvas" class="draw-canvas" width="900" height="900"></canvas>
+        <div class="dialog-actions">
+          <button id="draw-close" class="btn ghost" type="button">Cancel</button>
+          <button id="draw-send" class="btn primary" type="button">Send drawing</button>
+        </div>
+      </div>
+    </dialog>
+
+    <!-- Crumbs builder -->
+    <dialog id="crumb-dialog" class="crumb-dialog">
+      <div class="crumb-builder">
+        <header class="cb-head">
+          <input id="cb-title" maxlength="60" placeholder="Crumb name (optional)" />
+          <select id="cb-aspect" aria-label="Shape">
+            <option value="square">Square</option>
+            <option value="tall">Tall</option>
+            <option value="wide">Wide</option>
+          </select>
+          <input id="cb-bg" type="color" value="#fff7ec" title="Background color" />
+          <button id="cb-close" class="icon-close" type="button" aria-label="Close">×</button>
+        </header>
+        <div class="cb-tabs" role="tablist">
+          <button class="cb-tab active" data-tab="build" type="button">Build</button>
+          <button class="cb-tab" data-tab="rules" type="button">Rules</button>
+          <button class="cb-tab" data-tab="test" type="button">Test</button>
+        </div>
+        <div class="cb-body">
+          <section class="cb-pane" data-pane="build">
+            <div class="cb-add">
+              <button type="button" data-add="button">+ Button</button>
+              <button type="button" data-add="text">+ Text</button>
+              <button type="button" data-add="image">+ Image</button>
+              <button type="button" data-add="counter">+ Counter</button>
+              <button type="button" data-add="timer">+ Timer</button>
+              <button type="button" data-add="box">+ Box</button>
+              <input id="cb-image-input" type="file" accept="image/*" hidden />
+            </div>
+            <div class="cb-stage-wrap"><div id="cb-stage" class="crumb-card cb-stage"></div></div>
+            <div id="cb-props" class="cb-props"></div>
+          </section>
+          <section class="cb-pane" data-pane="rules" hidden>
+            <div class="cb-timers">
+              <h3>Timers</h3>
+              <div id="cb-timer-list"></div>
+              <button id="cb-add-timer" class="btn ghost small" type="button">+ Timer</button>
+            </div>
+            <h3>Rules</h3>
+            <p class="hint">When something happens → do things. Everyone in the chat sees the same result.</p>
+            <div id="cb-rule-list" class="cb-rule-list"></div>
+            <button id="cb-add-rule" class="btn ghost small" type="button">+ Rule</button>
+          </section>
+          <section class="cb-pane" data-pane="test" hidden>
+            <p class="hint">Try it here. This test only happens on your screen.</p>
+            <div class="cb-stage-wrap"><div id="cb-test" class="crumb-card"></div></div>
+            <button id="cb-test-reset" class="btn ghost small" type="button">Restart test</button>
+          </section>
+        </div>
+        <p id="cb-error" class="error" hidden></p>
+        <footer class="cb-foot">
+          <button id="cb-send" class="btn primary" type="button">Send crumb</button>
+        </footer>
+      </div>
+    </dialog>
+
+    <!-- Roulette wheel -->
+    <div id="roulette-layer" class="roulette-layer" hidden>
+      <canvas id="roulette-canvas" width="600" height="600"></canvas>
+      <div id="roulette-result" class="roulette-result"></div>
+    </div>
+
     <!-- Click an image to enlarge it -->
     <div id="lightbox" class="lightbox" hidden>
       <div class="lightbox-bar">
@@ -431,8 +617,11 @@
 
     <script src="/socket.io/socket.io.js"></script>
     <script src="/theme.js"></script>
+    <script src="/crumbs-engine.js"></script>
     <script src="/fx.js"></script>
     <script src="/app.js"></script>
     <script src="/groups.js"></script>
+    <script src="/extras.js"></script>
+    <script src="/crumbs.js"></script>
   </body>
 </html>

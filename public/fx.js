@@ -3,7 +3,7 @@
 // (api, activeId, me, upsertMessage…) from inside functions.
 
 const Fx = (() => {
-  const MAX_SECONDS = 10;
+  const MAX_SECONDS = 600; // effects default to ~5–10s but can run longer
   const SEEN_KEY = "lc-fx-seen";
 
   // ---------- small helpers ----------
@@ -229,8 +229,39 @@ const Fx = (() => {
     return ytApi;
   }
 
+  const SCREEN_LABELS = {
+    shake: "Shake",
+    flip: "Upside down",
+    mirror: "Mirror",
+    spin: "Spin",
+    wobble: "Wobble",
+    tilt: "Tilt",
+    zoom: "Zoom pulse",
+    invert: "Invert colors",
+    rainbow: "Rainbow",
+    grayscale: "Black & white",
+  };
+  const COLOR_KINDS = ["invert", "rainbow", "grayscale"];
+
+  function setScreen(kind, on) {
+    const target = COLOR_KINDS.includes(kind) ? document.body : document.documentElement;
+    target.classList.toggle(`scr-${kind}`, on);
+  }
+
+  function clearScreens() {
+    for (const kind of Object.keys(SCREEN_LABELS)) setScreen(kind, false);
+  }
+
+  // One-off screen effect (used by crumbs).
+  function screenPulse(kind, secs) {
+    if (!SCREEN_LABELS[kind]) return;
+    setScreen(kind, true);
+    setTimeout(() => setScreen(kind, false), Math.min(30, secs || 2) * 1000);
+  }
+
   function stop() {
     playToken += 1;
+    clearScreens();
     if (!playing) return;
     const current = playing;
     playing = null;
@@ -525,6 +556,13 @@ const Fx = (() => {
       el.classList.add("show");
       if (state.haltMusic) state.timers.push(setTimeout(state.haltMusic, musicLength));
       let total = musicLength;
+      for (const item of effect.screen || []) {
+        const startAt = Math.max(0, item.s || 0) * 1000;
+        const end = Math.min(MAX_SECONDS, item.e || 3) * 1000;
+        total = Math.max(total, end);
+        state.timers.push(setTimeout(() => setScreen(item.k, true), startAt));
+        state.timers.push(setTimeout(() => setScreen(item.k, false), end));
+      }
       for (const { overlay, url } of items) {
         const img = document.createElement("img");
         img.className = "fx-overlay";
@@ -552,11 +590,16 @@ const Fx = (() => {
       );
     };
 
+    state.cleanup.push(clearScreens);
     if (music) startMusic(music, urlFor, state, showVisuals);
     else showVisuals();
   }
 
   function playMessage(message) {
+    if (message.fx?.roulette) {
+      Extras.spinRoulette(message.fx.roulette);
+      return;
+    }
     const effect = message.fx?.effect;
     if (!effect) return;
     play(effect, assetUrl);
@@ -569,7 +612,7 @@ const Fx = (() => {
     let target = null;
     let changed = false;
     for (const message of messages) {
-      if (!message.fx?.effect || seen.has(message.id)) continue;
+      if ((!message.fx?.effect && !message.fx?.roulette) || seen.has(message.id)) continue;
       seen.add(message.id);
       changed = true;
       if (!message.mine && !message.blocked) target = message;
@@ -941,13 +984,16 @@ const Fx = (() => {
   document.getElementById("emoji-manage").addEventListener("click", openManager);
 
   // ---------- sending ----------
-  async function sendFx(fx, fxFiles, body = "") {
+  async function sendFx(fx, fxFiles, body = "", extraFiles = []) {
     if (!activeId) throw new Error("Open a chat first.");
     const form = new FormData();
     form.append("body", body);
-    form.append("fx", JSON.stringify(fx));
+    if (fx) form.append("fx", JSON.stringify(fx));
     for (const file of fxFiles) form.append("fxfiles", file);
+    for (const file of extraFiles) form.append("files", file);
+    Extras.applySendOptions(form);
     const message = await api(`/api/conversations/${activeId}/messages`, { method: "POST", body: form });
+    Extras.clearSendOptions();
     markSeen(message.id);
     if (typeof isFiltering === "function" && isFiltering()) clearFilter();
     stickToBottom = true;
@@ -971,6 +1017,26 @@ const Fx = (() => {
   let audioFile = null;
   let nextOverlayId = 1;
   let editingId = null; // set while editing an existing message
+  let screens = []; // [{k, s, e}]
+
+  function renderScreenList() {
+    const list = document.getElementById("fx-screen-list");
+    list.replaceChildren();
+    screens.forEach((item, index) => {
+      const chip = document.createElement("span");
+      chip.className = "file-chip";
+      chip.textContent = `${SCREEN_LABELS[item.k]} ${item.s}s–${item.e}s `;
+      const x = document.createElement("button");
+      x.type = "button";
+      x.textContent = "×";
+      x.addEventListener("click", () => {
+        screens.splice(index, 1);
+        renderScreenList();
+      });
+      chip.append(x);
+      list.append(chip);
+    });
+  }
 
   function cleanStyle(st) {
     const out = {};
@@ -1474,7 +1540,7 @@ const Fx = (() => {
     bar.className = "place-bar";
     bar.innerHTML = `
       <label class="btn ghost small file-btn">Add image / GIF<input type="file" accept="image/*" multiple hidden></label>
-      <span class="place-times">Show <input type="number" min="0" max="9.5" step="0.5" data-t="s">s → <input type="number" min="0.5" max="10" step="0.5" data-t="e">s</span>
+      <span class="place-times">Show <input type="number" min="0" max="599" step="0.5" data-t="s">s → <input type="number" min="0.5" max="600" step="0.5" data-t="e">s</span>
       <button type="button" class="btn ghost small" data-act="remove">Remove</button>
       <button type="button" class="btn ghost small" data-act="preview">▶ Preview</button>
       <button type="button" class="btn primary small" data-act="done">Done</button>`;
@@ -1489,9 +1555,9 @@ const Fx = (() => {
     for (const input of bar.querySelectorAll("input[data-t]")) {
       input.addEventListener("change", () => {
         if (!selectedOverlay) return;
-        const s = Math.min(9.5, Math.max(0, Number(bar.querySelector('[data-t="s"]').value) || 0));
-        let e = Math.min(10, Math.max(0.5, Number(bar.querySelector('[data-t="e"]').value) || 10));
-        if (e <= s) e = Math.min(10, s + 0.5);
+        const s = Math.min(MAX_SECONDS - 0.5, Math.max(0, Number(bar.querySelector('[data-t="s"]').value) || 0));
+        let e = Math.min(MAX_SECONDS, Math.max(0.5, Number(bar.querySelector('[data-t="e"]').value) || 5));
+        if (e <= s) e = Math.min(MAX_SECONDS, s + 0.5);
         selectedOverlay.s = s;
         selectedOverlay.e = e;
         paintTimes();
@@ -1683,6 +1749,10 @@ const Fx = (() => {
     if (audioFile && !audioFile.existingId) URL.revokeObjectURL(audioFile.url);
     audioFile = null;
     editingId = null;
+    screens = [];
+    renderScreenList();
+    document.getElementById("fx-boom-style").value = "";
+    document.getElementById("fx-boom-secs").value = "5";
     paintMode();
     document.getElementById("fx-audio-name").textContent = "";
     document.getElementById("fx-yt-url").value = "";
@@ -1734,6 +1804,12 @@ const Fx = (() => {
       });
     }
     selectedOverlay = overlays[0] || null;
+    screens = (effect?.screen || []).map((item) => ({ ...item }));
+    renderScreenList();
+    if (message.fx?.boom) {
+      document.getElementById("fx-boom-style").value = message.fx.boom.style;
+      document.getElementById("fx-boom-secs").value = String(message.fx.boom.secs);
+    }
     const music = effect?.music;
     if (music) {
       const kind = music.yt ? "yt" : "file";
@@ -1787,9 +1863,9 @@ const Fx = (() => {
     if (kind !== "none") {
       const start = parseTime(document.getElementById("fx-music-start").value) ?? 0;
       let end = parseTime(document.getElementById("fx-music-end").value);
-      if (end === null) end = start + MAX_SECONDS;
+      if (end === null) end = start + 10; // default clip length
       if (end <= start) throw new Error("Music end has to be after the start.");
-      if (end - start > MAX_SECONDS + 0.001) throw new Error("Music can be up to 10 seconds long.");
+      if (end - start > MAX_SECONDS + 0.001) throw new Error("Music can be up to 10 minutes long.");
       const v = Number(document.getElementById("fx-music-vol").value);
       if (kind === "yt") {
         const info = youtubeInfo(document.getElementById("fx-yt-url").value);
@@ -1807,7 +1883,8 @@ const Fx = (() => {
         effect.music = { a, s: start, e: end, v };
       }
     }
-    return { effect: effect.overlays || effect.music ? effect : null, files };
+    if (screens.length) effect.screen = screens.map((item) => ({ ...item }));
+    return { effect: effect.overlays || effect.music || effect.screen ? effect : null, files };
   }
 
   for (const radio of document.querySelectorAll('input[name="fx-music"]')) {
@@ -1829,8 +1906,17 @@ const Fx = (() => {
     const endInput = document.getElementById("fx-music-end");
     if (info?.start != null && !startInput.value) {
       startInput.value = formatTime(info.start);
-      if (!endInput.value) endInput.value = formatTime(info.start + MAX_SECONDS);
+      if (!endInput.value) endInput.value = formatTime(info.start + 10);
     }
+  });
+
+  document.getElementById("fx-screen-add").addEventListener("click", () => {
+    const k = document.getElementById("fx-screen-kind").value;
+    const sVal = Math.max(0, Number(document.getElementById("fx-screen-s").value) || 0);
+    let eVal = Number(document.getElementById("fx-screen-e").value) || sVal + 3;
+    if (eVal <= sVal) eVal = sVal + 0.5;
+    screens.push({ k, s: sVal, e: Math.min(MAX_SECONDS, eVal) });
+    renderScreenList();
   });
 
   document.getElementById("fx-preview").addEventListener("click", () => {
@@ -1863,6 +1949,13 @@ const Fx = (() => {
       const fx = {};
       if (spans.length) fx.spans = spans;
       if (effect) fx.effect = effect;
+      const boomStyle = document.getElementById("fx-boom-style").value;
+      if (boomStyle) {
+        fx.boom = {
+          style: boomStyle,
+          secs: Math.min(60, Math.max(1, Number(document.getElementById("fx-boom-secs").value) || 5)),
+        };
+      }
       if (!spans.length && !effect) {
         showError(fxError, "Write something or add an effect first.");
         return;
@@ -1925,6 +2018,14 @@ const Fx = (() => {
     openManager,
     openEditor,
     openEditForMessage,
+    sendFx,
+    screenPulse,
+    SCREEN_LABELS,
+    openEditorWith(options = {}) {
+      resetEditor();
+      if (options.boom) document.getElementById("fx-boom-style").value = options.boom;
+      openEditor(composeInput.value.trim());
+    },
     emojiImg,
     async onEmojisChanged() {
       await Emoji.load();

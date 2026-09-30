@@ -15,6 +15,11 @@ const EXT = {
   wav: "audio/wav",
   ogg: "audio/ogg",
   m4a: "audio/mp4",
+  weba: "audio/webm",
+  opus: "audio/ogg",
+  oga: "audio/ogg",
+  aac: "audio/aac",
+  flac: "audio/flac",
 };
 
 export function guessMime(name, fallback = "") {

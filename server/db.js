@@ -28,6 +28,11 @@ function emptyStore() {
     emojis: [],
     pack_subs: [],
     reactions: [],
+    poll_votes: [],
+    message_views: [],
+    star_gifts: [],
+    conversation_reads: [],
+    crumb_state: {},
   };
 }
 
@@ -49,6 +54,10 @@ function migrateFileStore() {
   if (!Array.isArray(fileStore.emojis)) fileStore.emojis = [];
   if (!Array.isArray(fileStore.pack_subs)) fileStore.pack_subs = [];
   if (!Array.isArray(fileStore.reactions)) fileStore.reactions = [];
+  for (const key of ["poll_votes", "message_views", "star_gifts", "conversation_reads"]) {
+    if (!Array.isArray(fileStore[key])) fileStore[key] = [];
+  }
+  if (!fileStore.crumb_state || typeof fileStore.crumb_state !== "object") fileStore.crumb_state = {};
   for (const conversation of fileStore.conversations) {
     if (conversation.created_by === undefined) conversation.created_by = null;
     if (conversation.avatar_id === undefined) conversation.avatar_id = null;
@@ -125,11 +134,13 @@ function mapPgMessage(row) {
     edited_at: row.edited_at || null,
     deleted: Boolean(row.deleted),
     forwarded: Boolean(row.forwarded),
-    reactions: Array.isArray(row.reactions)
-      ? row.reactions
-      : typeof row.reactions === "string"
-        ? JSON.parse(row.reactions)
-        : [],
+    reactions: jsonList(row.reactions),
+    votes: jsonList(row.votes),
+    views: jsonList(row.views),
+    stars: jsonList(row.stars),
+    crumb_state: row.crumb_state ? parseFx(row.crumb_state) : null,
+    reply_to: row.reply_to || null,
+    scheduled_for: row.scheduled_for || null,
   };
 }
 
@@ -302,6 +313,41 @@ export async function initDb() {
         PRIMARY KEY (message_id, user_id, rkey)
       );
       CREATE INDEX IF NOT EXISTS reactions_message ON reactions (message_id);
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to TEXT;
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS scheduled_for TIMESTAMPTZ;
+      CREATE TABLE IF NOT EXISTS poll_votes (
+        message_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        option INTEGER NOT NULL,
+        PRIMARY KEY (message_id, user_id, option)
+      );
+      CREATE TABLE IF NOT EXISTS message_views (
+        message_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        PRIMARY KEY (message_id, user_id)
+      );
+      CREATE TABLE IF NOT EXISTS star_gifts (
+        message_id TEXT NOT NULL,
+        giver_id TEXT NOT NULL,
+        receiver_id TEXT NOT NULL,
+        stars INTEGER NOT NULL,
+        day TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (message_id, giver_id)
+      );
+      CREATE INDEX IF NOT EXISTS star_gifts_receiver ON star_gifts (receiver_id);
+      CREATE INDEX IF NOT EXISTS star_gifts_giver_day ON star_gifts (giver_id, day);
+      CREATE TABLE IF NOT EXISTS conversation_reads (
+        conversation_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        read_at TIMESTAMPTZ NOT NULL,
+        PRIMARY KEY (conversation_id, user_id)
+      );
+      CREATE TABLE IF NOT EXISTS crumb_state (
+        message_id TEXT PRIMARY KEY,
+        state TEXT NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
     `);
     await pool.query(`
       CREATE INDEX IF NOT EXISTS messages_conv_created
@@ -588,13 +634,13 @@ export async function listConversations(userId) {
              CASE WHEN m.fx IS NOT NULL THEN 'Sent an effect' END
            )
            FROM messages m
-           WHERE m.conversation_id = c.id
+           WHERE m.conversation_id = c.id AND m.scheduled_for IS NULL
            ORDER BY m.created_at DESC
            LIMIT 1
          ) AS last_message,
          (
            SELECT m.created_at FROM messages m
-           WHERE m.conversation_id = c.id
+           WHERE m.conversation_id = c.id AND m.scheduled_for IS NULL
            ORDER BY m.created_at DESC
            LIMIT 1
          ) AS last_at
@@ -606,7 +652,7 @@ export async function listConversations(userId) {
        OR c.user_low = $1 OR c.user_high = $1
        ORDER BY COALESCE(
          (SELECT m.created_at FROM messages m
-          WHERE m.conversation_id = c.id
+          WHERE m.conversation_id = c.id AND m.scheduled_for IS NULL
           ORDER BY m.created_at DESC LIMIT 1),
          c.created_at
        ) DESC`,
@@ -652,7 +698,7 @@ export async function listConversations(userId) {
       const isGroup = item.type === "group";
       const other = members.find((member) => member.id !== userId);
       const messages = fileStore.messages
-        .filter((message) => message.conversation_id === item.id)
+        .filter((message) => message.conversation_id === item.id && !message.scheduled_for)
         .sort((a, b) => a.created_at.localeCompare(b.created_at));
       const last = messages[messages.length - 1];
       return {
@@ -670,7 +716,49 @@ export async function listConversations(userId) {
     .sort((a, b) => String(b.last_at).localeCompare(String(a.last_at)));
 }
 
-export async function listMessages(conversationId) {
+// Extra per-message data (reactions, poll votes, views, stars, crumb state).
+const EXTRA_COLS = `
+  m.reply_to,
+  m.scheduled_for,
+  (SELECT COALESCE(json_agg(json_build_object('k', r.rkey, 'u', r.user_id, 'n', ru.username) ORDER BY r.created_at), '[]')
+     FROM reactions r LEFT JOIN users ru ON ru.id = r.user_id WHERE r.message_id = m.id) AS reactions,
+  (SELECT COALESCE(json_agg(json_build_object('o', v.option, 'u', v.user_id, 'n', vu.username)), '[]')
+     FROM poll_votes v LEFT JOIN users vu ON vu.id = v.user_id WHERE v.message_id = m.id) AS votes,
+  (SELECT COALESCE(json_agg(w.user_id), '[]') FROM message_views w WHERE w.message_id = m.id) AS views,
+  (SELECT COALESCE(json_agg(json_build_object('u', g.giver_id, 'n', gu.username, 's', g.stars)), '[]')
+     FROM star_gifts g LEFT JOIN users gu ON gu.id = g.giver_id WHERE g.message_id = m.id) AS stars,
+  (SELECT cs.state FROM crumb_state cs WHERE cs.message_id = m.id) AS crumb_state`;
+
+function jsonList(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+function fileExtras(message) {
+  const name = (id) => fileStore.users.find((user) => user.id === id)?.username || null;
+  return {
+    reply_to: message.reply_to || null,
+    scheduled_for: message.scheduled_for || null,
+    reactions: fileReactions(message.id),
+    votes: fileStore.poll_votes
+      .filter((v) => v.message_id === message.id)
+      .map((v) => ({ o: v.option, u: v.user_id, n: name(v.user_id) })),
+    views: fileStore.message_views.filter((v) => v.message_id === message.id).map((v) => v.user_id),
+    stars: fileStore.star_gifts
+      .filter((g) => g.message_id === message.id)
+      .map((g) => ({ u: g.giver_id, n: name(g.giver_id), s: g.stars })),
+    crumb_state: fileStore.crumb_state[message.id] || null,
+  };
+}
+
+export async function listMessages(conversationId, viewerId = null) {
   if (pool) {
     const rows = await pgQuery(
       `SELECT
@@ -684,14 +772,7 @@ export async function listMessages(conversationId) {
          m.edited_at,
          m.deleted,
          m.forwarded,
-         (
-           SELECT COALESCE(
-             json_agg(json_build_object('k', r.rkey, 'u', r.user_id, 'n', ru.username) ORDER BY r.created_at),
-             '[]'
-           )
-           FROM reactions r LEFT JOIN users ru ON ru.id = r.user_id
-           WHERE r.message_id = m.id
-         ) AS reactions,
+         ${EXTRA_COLS},
          u.avatar_id,
          u.username AS sender_username,
          u.name_color,
@@ -706,15 +787,22 @@ export async function listMessages(conversationId) {
        LEFT JOIN attachments a ON a.message_id = m.id
        LEFT JOIN users u ON u.id = m.sender_id
        WHERE m.conversation_id = $1
+         AND (m.scheduled_for IS NULL OR m.sender_id = $2)
        GROUP BY m.id, u.avatar_id, u.username, u.name_color
-       ORDER BY m.created_at ASC`,
-      [conversationId]
+       ORDER BY COALESCE(m.scheduled_for, m.created_at) ASC`,
+      [conversationId, viewerId || ""]
     );
     return rows.map(mapPgMessage);
   }
   return fileStore.messages
-    .filter((message) => message.conversation_id === conversationId)
-    .sort((a, b) => a.created_at.localeCompare(b.created_at))
+    .filter(
+      (message) =>
+        message.conversation_id === conversationId &&
+        (!message.scheduled_for || message.sender_id === viewerId)
+    )
+    .sort((a, b) =>
+      String(a.scheduled_for || a.created_at).localeCompare(String(b.scheduled_for || b.created_at))
+    )
     .map((message) => {
       const sender = fileStore.users.find((user) => user.id === message.sender_id);
       return {
@@ -732,7 +820,7 @@ export async function listMessages(conversationId) {
         edited_at: message.edited_at || null,
         deleted: Boolean(message.deleted),
         forwarded: Boolean(message.forwarded),
-        reactions: fileReactions(message.id),
+        ...fileExtras(message),
       };
     });
 }
@@ -743,8 +831,11 @@ export async function addMessage(
   body,
   attachments = [],
   fx = null,
-  forwarded = false
+  forwarded = false,
+  options = {}
 ) {
+  const replyTo = options.replyTo || null;
+  const scheduledFor = options.scheduledFor || null;
   const id = randomUUID();
   const createdAt = new Date().toISOString();
   const files = attachments.map((file) => ({
@@ -756,9 +847,18 @@ export async function addMessage(
   }));
   if (pool) {
     await pgQuery(
-      `INSERT INTO messages (id, conversation_id, sender_id, body, pinned, fx, forwarded)
-       VALUES ($1, $2, $3, $4, FALSE, $5, $6)`,
-      [id, conversationId, senderId, body, fx ? JSON.stringify(fx) : null, Boolean(forwarded)]
+      `INSERT INTO messages (id, conversation_id, sender_id, body, pinned, fx, forwarded, reply_to, scheduled_for)
+       VALUES ($1, $2, $3, $4, FALSE, $5, $6, $7, $8)`,
+      [
+        id,
+        conversationId,
+        senderId,
+        body,
+        fx ? JSON.stringify(fx) : null,
+        Boolean(forwarded),
+        replyTo,
+        scheduledFor,
+      ]
     );
     for (const file of files) {
       await pgQuery(
@@ -781,6 +881,13 @@ export async function addMessage(
       name_color: sender?.name_color || "#6e8070",
       fx,
       forwarded: Boolean(forwarded),
+      reply_to: replyTo,
+      scheduled_for: scheduledFor,
+      reactions: [],
+      votes: [],
+      views: [],
+      stars: [],
+      crumb_state: null,
     };
   }
   const sender = fileStore.users.find((user) => user.id === senderId);
@@ -794,6 +901,8 @@ export async function addMessage(
     attachments: files,
     fx,
     forwarded: Boolean(forwarded),
+    reply_to: replyTo,
+    scheduled_for: scheduledFor,
   };
   fileStore.messages.push(message);
   saveFileStore();
@@ -802,6 +911,7 @@ export async function addMessage(
     avatar_id: sender?.avatar_id || null,
     sender_username: sender?.username || null,
     name_color: sender?.name_color || "#6e8070",
+    ...fileExtras(message),
   };
 }
 
@@ -809,14 +919,7 @@ export async function getMessage(messageId) {
   if (pool) {
     const rows = await pgQuery(
       `SELECT m.id, m.conversation_id, m.sender_id, m.body, m.pinned, m.created_at, m.fx, m.edited_at, m.deleted, m.forwarded,
-              (
-                SELECT COALESCE(
-                  json_agg(json_build_object('k', r.rkey, 'u', r.user_id, 'n', ru.username) ORDER BY r.created_at),
-                  '[]'
-                )
-                FROM reactions r LEFT JOIN users ru ON ru.id = r.user_id
-                WHERE r.message_id = m.id
-              ) AS reactions,
+              ${EXTRA_COLS},
               u.avatar_id, u.username AS sender_username, u.name_color
        FROM messages m
        LEFT JOIN users u ON u.id = m.sender_id
@@ -839,7 +942,7 @@ export async function getMessage(messageId) {
     avatar_id: sender?.avatar_id || null,
     sender_username: sender?.username || null,
     name_color: sender?.name_color || "#6e8070",
-    reactions: fileReactions(message.id),
+    ...fileExtras(message),
   };
 }
 
@@ -909,7 +1012,7 @@ export async function wipeExpiredMessages(now = new Date()) {
     try {
       await client.query("BEGIN");
       const expired = await client.query(
-        `DELETE FROM messages WHERE pinned = FALSE AND created_at < $1 RETURNING id`,
+        `DELETE FROM messages WHERE pinned = FALSE AND scheduled_for IS NULL AND created_at < $1 RETURNING id`,
         [cutoff]
       );
       removedMessages = expired.rowCount;
@@ -920,9 +1023,11 @@ export async function wipeExpiredMessages(now = new Date()) {
          RETURNING a.id`
       );
       removedFiles = files.rows;
-      await client.query(
-        `DELETE FROM reactions r WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.id = r.message_id)`
-      );
+      for (const table of ["reactions", "poll_votes", "message_views", "crumb_state"]) {
+        await client.query(
+          `DELETE FROM ${table} x WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.id = x.message_id)`
+        );
+      }
       await client.query("COMMIT");
     } catch (err) {
       await client.query("ROLLBACK");
@@ -933,7 +1038,7 @@ export async function wipeExpiredMessages(now = new Date()) {
   } else {
     const keep = [];
     for (const message of fileStore.messages) {
-      if (!message.pinned && message.created_at < cutoff) {
+      if (!message.pinned && !message.scheduled_for && message.created_at < cutoff) {
         removedMessages += 1;
         for (const file of message.attachments || []) {
           removedFiles.push({ id: file.id });
@@ -946,6 +1051,11 @@ export async function wipeExpiredMessages(now = new Date()) {
       fileStore.messages = keep;
       const alive = new Set(keep.map((message) => message.id));
       fileStore.reactions = fileStore.reactions.filter((r) => alive.has(r.message_id));
+      fileStore.poll_votes = fileStore.poll_votes.filter((r) => alive.has(r.message_id));
+      fileStore.message_views = fileStore.message_views.filter((r) => alive.has(r.message_id));
+      for (const id of Object.keys(fileStore.crumb_state)) {
+        if (!alive.has(id)) delete fileStore.crumb_state[id];
+      }
       saveFileStore();
     }
   }
@@ -1900,13 +2010,18 @@ export async function deleteMessageContent(messageId) {
       `UPDATE messages SET body = '', fx = NULL, pinned = FALSE, deleted = TRUE WHERE id = $1`,
       [messageId]
     );
-    await pgQuery(`DELETE FROM reactions WHERE message_id = $1`, [messageId]);
+    for (const table of ["reactions", "poll_votes", "message_views", "crumb_state"]) {
+      await pgQuery(`DELETE FROM ${table} WHERE message_id = $1`, [messageId]);
+    }
   } else {
     const message = fileStore.messages.find((item) => item.id === messageId);
     if (!message) return null;
     fileIds.push(...(message.attachments || []).map((file) => file.id));
     Object.assign(message, { body: "", fx: null, pinned: false, deleted: true, attachments: [] });
     fileStore.reactions = fileStore.reactions.filter((r) => r.message_id !== messageId);
+    fileStore.poll_votes = fileStore.poll_votes.filter((r) => r.message_id !== messageId);
+    fileStore.message_views = fileStore.message_views.filter((r) => r.message_id !== messageId);
+    delete fileStore.crumb_state[messageId];
     saveFileStore();
   }
   for (const id of fileIds) {
@@ -1960,4 +2075,256 @@ export async function countUserReactions(messageId, userId) {
     return rows[0]?.n || 0;
   }
   return fileStore.reactions.filter((r) => r.message_id === messageId && r.user_id === userId).length;
+}
+
+// ---- polls ----
+
+export async function setPollVote(messageId, userId, option, multi) {
+  if (pool) {
+    const has = await pgQuery(
+      `SELECT 1 FROM poll_votes WHERE message_id = $1 AND user_id = $2 AND option = $3`,
+      [messageId, userId, option]
+    );
+    if (has.length) {
+      await pgQuery(`DELETE FROM poll_votes WHERE message_id = $1 AND user_id = $2 AND option = $3`, [
+        messageId,
+        userId,
+        option,
+      ]);
+      return;
+    }
+    if (!multi) {
+      await pgQuery(`DELETE FROM poll_votes WHERE message_id = $1 AND user_id = $2`, [messageId, userId]);
+    }
+    await pgQuery(`INSERT INTO poll_votes (message_id, user_id, option) VALUES ($1, $2, $3)`, [
+      messageId,
+      userId,
+      option,
+    ]);
+    return;
+  }
+  const mine = (v) => v.message_id === messageId && v.user_id === userId;
+  const existing = fileStore.poll_votes.findIndex((v) => mine(v) && v.option === option);
+  if (existing >= 0) fileStore.poll_votes.splice(existing, 1);
+  else {
+    if (!multi) fileStore.poll_votes = fileStore.poll_votes.filter((v) => !mine(v));
+    fileStore.poll_votes.push({ message_id: messageId, user_id: userId, option });
+  }
+  saveFileStore();
+}
+
+// ---- self-destructing messages: who has seen them ----
+
+export async function addView(messageId, userId) {
+  if (pool) {
+    await pgQuery(
+      `INSERT INTO message_views (message_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+      [messageId, userId]
+    );
+    return;
+  }
+  if (!fileStore.message_views.some((v) => v.message_id === messageId && v.user_id === userId)) {
+    fileStore.message_views.push({ message_id: messageId, user_id: userId });
+    saveFileStore();
+  }
+}
+
+// ---- stars ----
+
+export async function starsGivenOn(giverId, day) {
+  if (pool) {
+    const rows = await pgQuery(
+      `SELECT COALESCE(SUM(stars), 0)::int AS n FROM star_gifts WHERE giver_id = $1 AND day = $2`,
+      [giverId, day]
+    );
+    return rows[0]?.n || 0;
+  }
+  return fileStore.star_gifts
+    .filter((g) => g.giver_id === giverId && g.day === day)
+    .reduce((sum, g) => sum + g.stars, 0);
+}
+
+export async function starsReceived(userId) {
+  if (pool) {
+    const rows = await pgQuery(
+      `SELECT COALESCE(SUM(stars), 0)::int AS n FROM star_gifts WHERE receiver_id = $1`,
+      [userId]
+    );
+    return rows[0]?.n || 0;
+  }
+  return fileStore.star_gifts.filter((g) => g.receiver_id === userId).reduce((sum, g) => sum + g.stars, 0);
+}
+
+export async function hasStarred(messageId, giverId) {
+  if (pool) {
+    const rows = await pgQuery(`SELECT 1 FROM star_gifts WHERE message_id = $1 AND giver_id = $2`, [
+      messageId,
+      giverId,
+    ]);
+    return rows.length > 0;
+  }
+  return fileStore.star_gifts.some((g) => g.message_id === messageId && g.giver_id === giverId);
+}
+
+export async function giveStars(messageId, giverId, receiverId, stars, day) {
+  if (pool) {
+    await pgQuery(
+      `INSERT INTO star_gifts (message_id, giver_id, receiver_id, stars, day) VALUES ($1, $2, $3, $4, $5)`,
+      [messageId, giverId, receiverId, stars, day]
+    );
+    return;
+  }
+  fileStore.star_gifts.push({
+    message_id: messageId,
+    giver_id: giverId,
+    receiver_id: receiverId,
+    stars,
+    day,
+    created_at: new Date().toISOString(),
+  });
+  saveFileStore();
+}
+
+// ---- read receipts ----
+
+export async function setRead(conversationId, userId, readAt) {
+  if (pool) {
+    await pgQuery(
+      `INSERT INTO conversation_reads (conversation_id, user_id, read_at) VALUES ($1, $2, $3)
+       ON CONFLICT (conversation_id, user_id)
+       DO UPDATE SET read_at = GREATEST(conversation_reads.read_at, EXCLUDED.read_at)`,
+      [conversationId, userId, readAt]
+    );
+    return;
+  }
+  const row = fileStore.conversation_reads.find(
+    (r) => r.conversation_id === conversationId && r.user_id === userId
+  );
+  if (row) {
+    if (String(readAt) > String(row.read_at)) row.read_at = readAt;
+  } else {
+    fileStore.conversation_reads.push({ conversation_id: conversationId, user_id: userId, read_at: readAt });
+  }
+  saveFileStore();
+}
+
+export async function listReads(conversationId) {
+  if (pool) {
+    return pgQuery(
+      `SELECT r.user_id, r.read_at, u.username, u.avatar_id
+       FROM conversation_reads r JOIN users u ON u.id = r.user_id
+       WHERE r.conversation_id = $1`,
+      [conversationId]
+    );
+  }
+  return fileStore.conversation_reads
+    .filter((r) => r.conversation_id === conversationId)
+    .map((r) => {
+      const user = fileStore.users.find((item) => item.id === r.user_id);
+      return { ...r, username: user?.username || null, avatar_id: user?.avatar_id || null };
+    });
+}
+
+// ---- crumbs ----
+
+export async function setCrumbState(messageId, state) {
+  const json = JSON.stringify(state);
+  if (pool) {
+    await pgQuery(
+      `INSERT INTO crumb_state (message_id, state, updated_at) VALUES ($1, $2, NOW())
+       ON CONFLICT (message_id) DO UPDATE SET state = EXCLUDED.state, updated_at = NOW()`,
+      [messageId, json]
+    );
+    return;
+  }
+  fileStore.crumb_state[messageId] = state;
+  saveFileStore();
+}
+
+// ---- scheduled messages ----
+
+export async function dueScheduledMessages(now = new Date()) {
+  if (pool) {
+    const rows = await pgQuery(
+      `SELECT id FROM messages WHERE scheduled_for IS NOT NULL AND scheduled_for <= $1`,
+      [now.toISOString()]
+    );
+    return rows.map((row) => row.id);
+  }
+  const iso = now.toISOString();
+  return fileStore.messages
+    .filter((m) => m.scheduled_for && m.scheduled_for <= iso)
+    .map((m) => m.id);
+}
+
+export async function markDelivered(messageId) {
+  if (pool) {
+    await pgQuery(
+      `UPDATE messages SET created_at = COALESCE(scheduled_for, NOW()), scheduled_for = NULL WHERE id = $1`,
+      [messageId]
+    );
+    return;
+  }
+  const message = fileStore.messages.find((m) => m.id === messageId);
+  if (!message) return;
+  message.created_at = message.scheduled_for || new Date().toISOString();
+  message.scheduled_for = null;
+  saveFileStore();
+}
+
+// Completely removes a message (used for cancelling a scheduled one).
+export async function hardDeleteMessage(messageId) {
+  const fileIds = [];
+  if (pool) {
+    const rows = await pgQuery(`SELECT id FROM attachments WHERE message_id = $1`, [messageId]);
+    fileIds.push(...rows.map((row) => row.id));
+    await pgQuery(`DELETE FROM attachments WHERE message_id = $1`, [messageId]);
+    for (const table of ["reactions", "poll_votes", "message_views", "crumb_state"]) {
+      await pgQuery(`DELETE FROM ${table} WHERE message_id = $1`, [messageId]);
+    }
+    await pgQuery(`DELETE FROM messages WHERE id = $1`, [messageId]);
+  } else {
+    const message = fileStore.messages.find((item) => item.id === messageId);
+    if (message) fileIds.push(...(message.attachments || []).map((file) => file.id));
+    fileStore.messages = fileStore.messages.filter((item) => item.id !== messageId);
+    fileStore.reactions = fileStore.reactions.filter((r) => r.message_id !== messageId);
+    fileStore.poll_votes = fileStore.poll_votes.filter((r) => r.message_id !== messageId);
+    fileStore.message_views = fileStore.message_views.filter((r) => r.message_id !== messageId);
+    delete fileStore.crumb_state[messageId];
+    saveFileStore();
+  }
+  for (const id of fileIds) {
+    try {
+      fs.unlinkSync(attachmentPath(id));
+    } catch {
+      // already gone
+    }
+  }
+}
+
+// Self-destructed for everyone: drop the content and files, keep a marker.
+export async function vanishMessage(messageId) {
+  const fileIds = [];
+  const gone = JSON.stringify({ gone: true });
+  if (pool) {
+    const rows = await pgQuery(`SELECT id FROM attachments WHERE message_id = $1`, [messageId]);
+    fileIds.push(...rows.map((row) => row.id));
+    await pgQuery(`DELETE FROM attachments WHERE message_id = $1`, [messageId]);
+    await pgQuery(`UPDATE messages SET body = '', fx = $2, pinned = FALSE WHERE id = $1`, [messageId, gone]);
+    await pgQuery(`DELETE FROM reactions WHERE message_id = $1`, [messageId]);
+  } else {
+    const message = fileStore.messages.find((item) => item.id === messageId);
+    if (!message) return;
+    fileIds.push(...(message.attachments || []).map((file) => file.id));
+    Object.assign(message, { body: "", fx: { gone: true }, pinned: false, attachments: [] });
+    fileStore.reactions = fileStore.reactions.filter((r) => r.message_id !== messageId);
+    saveFileStore();
+  }
+  for (const id of fileIds) {
+    try {
+      fs.unlinkSync(attachmentPath(id));
+    } catch {
+      // already gone
+    }
+  }
 }

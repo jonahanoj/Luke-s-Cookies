@@ -325,10 +325,21 @@ function connectSocket() {
     refreshConversations();
     if (payload.pinned || sideTab === "pinned") refreshPinned();
     if (payload.conversationId !== activeId) return;
-    upsertMessage(payload);
-    if (payload.fx?.effect && !payload.mine && document.visibilityState === "visible") {
+    Extras.clearTyping(payload.username);
+    upsertMessage(payload, true);
+    if ((payload.fx?.effect || payload.fx?.roulette) && !payload.mine && document.visibilityState === "visible") {
       Fx.autoplay([payload]);
     }
+    Extras.markRead();
+  });
+  socket.on("typing", (payload) => Extras.onTyping(payload));
+  socket.on("read", (payload) => Extras.onRead(payload));
+  socket.on("crumb", (payload) => Crumbs.onRemoteState(payload));
+  socket.on("stars-received", (payload) => Extras.onStarsReceived(payload));
+  socket.on("message-removed", (payload) => {
+    if (payload.conversationId !== activeId) return;
+    messagesEl.querySelector(`[data-id="${payload.id}"]`)?.remove();
+    activeMessages.delete(payload.id);
   });
   socket.on("conversation-updated", (payload) => Groups.onConversationUpdated(payload.conversationId));
   socket.on("tasks-changed", (payload) => Groups.onTasksChanged(payload.conversationId));
@@ -566,16 +577,7 @@ function renderAttachments(message) {
       video.addEventListener("loadedmetadata", keepBottomIfNeeded);
       wrap.append(video);
     } else if (kind === "audio") {
-      const box = document.createElement("div");
-      box.className = "audio-wrap";
-      const audio = document.createElement("audio");
-      audio.src = url;
-      audio.controls = true;
-      audio.preload = "metadata";
-      const label = document.createElement("span");
-      label.textContent = file.name;
-      box.append(audio, label);
-      wrap.append(box);
+      wrap.append(Extras.audioPlayer(url, file.name));
     } else {
       const card = document.createElement("a");
       card.className = "file-card";
@@ -629,13 +631,14 @@ function upsertMessage(message, replace = false) {
     if (existing) existing.replaceWith(row);
     else messagesEl.append(row);
     applyFilterToRow(row, message);
+    Extras.afterRender();
     return;
   }
 
   const whoName = message.mine ? "You" : message.username || activeChat?.username || "Them";
   const profileName = message.mine ? me?.username : message.username;
   const row = document.createElement("div");
-  row.className = "row " + (message.mine ? "mine" : "theirs");
+  row.className = "row " + (message.mine ? "mine" : "theirs") + (message.scheduledFor ? " scheduled" : "");
   row.dataset.id = message.id;
 
   const avatarUrl = message.mine ? me?.avatarUrl : message.avatarUrl;
@@ -646,7 +649,8 @@ function upsertMessage(message, replace = false) {
     "bubble " +
     (message.mine ? "mine" : "theirs") +
     (message.pinned ? " pinned" : "") +
-    (message.blocked ? " blocked" : "");
+    (message.blocked ? " blocked" : "") +
+    (message.gone ? " gone" : "");
 
   const top = document.createElement("div");
   top.className = "bubble-top";
@@ -658,124 +662,86 @@ function upsertMessage(message, replace = false) {
   if (profileName) who.addEventListener("click", () => openProfile(profileName));
   top.append(who);
 
-  if (message.fx?.effect && !message.blocked) {
-    const replay = document.createElement("button");
-    replay.type = "button";
-    replay.className = "pin-btn fx-replay";
-    replay.textContent = "▶ Effect";
-    replay.title = "Play this message's screen effect";
-    replay.addEventListener("click", (event) => {
+  const actions = document.createElement("span");
+  actions.className = "bubble-actions";
+  const addAction = (label, onClick, className = "") => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = `pin-btn ${className}`.trim();
+    b.textContent = label;
+    b.addEventListener("click", (event) => {
       event.stopPropagation();
-      Fx.playMessage(message);
+      onClick(event);
     });
-    top.append(replay);
-  }
+    actions.append(b);
+    return b;
+  };
 
-  if (message.mine) {
-    const edit = document.createElement("button");
-    edit.type = "button";
-    edit.className = "pin-btn";
-    edit.textContent = "Edit";
-    edit.addEventListener("click", (event) => {
-      event.stopPropagation();
-      Fx.openEditForMessage(message);
-    });
-    const del = document.createElement("button");
-    del.type = "button";
-    del.className = "pin-btn";
-    del.textContent = "Delete";
-    del.addEventListener("click", async (event) => {
-      event.stopPropagation();
-      if (!confirm("Delete this message? It will show as \"Deleted message\".")) return;
-      try {
-        const updated = await api(`/api/messages/${message.id}`, { method: "DELETE" });
-        upsertMessage(updated, true);
-        refreshConversations();
-        refreshPinned();
-      } catch (err) {
-        showError(composeError, err.message);
-      }
-    });
-    top.append(edit, del);
+  if (message.fx?.effect && !message.blocked && !message.gone) {
+    addAction("▶ Effect", () => Fx.playMessage(message), "fx-replay");
   }
-
+  if (!message.blocked && !message.gone && !message.scheduledFor) {
+    addAction("React", (event) => openReactionPicker(event.currentTarget, message), "react-btn");
+    addAction("Reply", () => Extras.startReply(message));
+  }
   if (!message.blocked) {
-    const react = document.createElement("button");
-    react.type = "button";
-    react.className = "pin-btn react-btn";
-    react.textContent = "React";
-    react.addEventListener("click", (event) => {
-      event.stopPropagation();
-      openReactionPicker(event.currentTarget, message);
-    });
-    top.append(react);
+    addAction("⋯", (event) => Extras.openMessageMenu(event.currentTarget, message), "more-btn");
   }
-
-  if (!message.blocked) {
-    const fwd = document.createElement("button");
-    fwd.type = "button";
-    fwd.className = "pin-btn";
-    fwd.textContent = "Forward";
-    fwd.addEventListener("click", (event) => {
-      event.stopPropagation();
-      openForward(message);
-    });
-    top.append(fwd);
-  }
-
-  if (!message.blocked) {
-    const pinBtn = document.createElement("button");
-    pinBtn.type = "button";
-    pinBtn.className = "pin-btn";
-    const tooBig = (message.totalSize || 0) > MAX_PIN_BYTES;
-    pinBtn.textContent = message.pinned ? "Unpin" : tooBig ? "Too big to pin" : "Pin";
-    pinBtn.disabled = !message.pinned && tooBig;
-    pinBtn.addEventListener("click", async (event) => {
-      event.stopPropagation();
-      try {
-        showError(composeError, "");
-        const path = message.pinned
-          ? `/api/messages/${message.id}/unpin`
-          : `/api/messages/${message.id}/pin`;
-        const updated = await api(path, { method: "POST" });
-        upsertMessage(updated, true);
-        refreshPinned();
-      } catch (err) {
-        showError(composeError, err.message);
-      }
-    });
-    top.append(pinBtn);
-  }
+  top.append(actions);
   bubble.append(top);
 
-  if (message.forwarded && !message.blocked) {
-    const tag = document.createElement("div");
-    tag.className = "forwarded-tag";
-    tag.textContent = "↪ Forwarded";
-    bubble.append(tag);
+  if (message.gone) {
+    const text = document.createElement("div");
+    text.className = "gone-note";
+    text.textContent = "💨 Self-destructed";
+    bubble.append(text);
+  } else {
+    if (message.reply && !message.blocked) bubble.append(Extras.renderReply(message.reply));
+
+    if (message.forwarded && !message.blocked) {
+      const tag = document.createElement("div");
+      tag.className = "forwarded-tag";
+      tag.textContent = "↪ Forwarded";
+      bubble.append(tag);
+    }
+
+    const content = document.createElement("div");
+    content.className = "bubble-content";
+    if (message.blocked) {
+      const text = document.createElement("div");
+      text.textContent = "Message from someone you blocked";
+      content.append(text);
+    } else if (message.fx?.spans) {
+      const text = document.createElement("div");
+      text.className = "body-text";
+      Fx.renderSpans(text, message.fx.spans, filterQuery);
+      content.append(text);
+    } else if (message.body && !message.fx?.roulette && !message.fx?.poll && !message.fx?.crumb) {
+      const text = document.createElement("div");
+      text.className = "body-text";
+      renderRichText(text, message.body, filterQuery);
+      content.append(text);
+    }
+    if (message.fx?.pack && !message.blocked) content.append(Fx.renderPackCard(message.fx.pack));
+    if (!message.blocked) Extras.renderExtras(message, content);
+    const files = renderAttachments(message);
+    if (files) content.append(files);
+    bubble.append(content);
+    if (!message.blocked) Extras.decorateBoom(message, bubble, content);
+    if (!message.blocked && message.reactions?.length) bubble.append(renderReactions(message));
   }
 
-  if (message.blocked) {
-    const text = document.createElement("div");
-    text.textContent = "Message from someone you blocked";
-    bubble.append(text);
-  } else if (message.fx?.spans) {
-    const text = document.createElement("div");
-    text.className = "body-text";
-    Fx.renderSpans(text, message.fx.spans, filterQuery);
-    bubble.append(text);
-  } else if (message.body) {
-    const text = document.createElement("div");
-    text.className = "body-text";
-    renderRichText(text, message.body, filterQuery);
-    bubble.append(text);
-  }
-  if (message.fx?.pack && !message.blocked) bubble.append(Fx.renderPackCard(message.fx.pack));
-  const files = renderAttachments(message);
-  if (files) bubble.append(files);
-  if (!message.blocked && message.reactions?.length) bubble.append(renderReactions(message));
   const time = document.createElement("time");
-  time.textContent = formatTime(message.createdAt) + (message.edited ? " · edited" : "");
+  time.textContent = message.scheduledFor
+    ? `⏰ Sends ${formatTime(message.scheduledFor)}`
+    : formatTime(message.createdAt) + (message.edited ? " · edited" : "");
+  if (message.stars?.total) {
+    const star = document.createElement("span");
+    star.className = "star-badge";
+    star.textContent = ` ★ ${message.stars.total}`;
+    star.title = message.stars.givers.map((g) => `${g.name}: ${g.stars}★`).join(", ");
+    time.append(star);
+  }
   bubble.append(time);
 
   // While filtering, clicking a result jumps to it in the full chat.
@@ -789,6 +755,7 @@ function upsertMessage(message, replace = false) {
   if (existing) existing.replaceWith(row);
   else messagesEl.append(row);
   applyFilterToRow(row, message);
+  Extras.afterRender();
   if (isFiltering()) updateFilterStatus();
   else if (!replace || stickToBottom) messagesEl.scrollTop = messagesEl.scrollHeight;
 }
@@ -799,10 +766,12 @@ async function loadMessages(conversationId) {
   messagesEl.replaceChildren();
   activeMessages = new Map();
   stickToBottom = true;
+  Extras.setReads(data.reads || []);
   for (const message of data.messages) upsertMessage(message);
   applyFilter();
   messagesEl.scrollTop = messagesEl.scrollHeight;
   Fx.autoplay(data.messages);
+  Extras.markRead();
 }
 
 async function openConversation(item) {
@@ -815,6 +784,7 @@ async function openConversation(item) {
   showError(composeError, "");
   if (switching) {
     Fx.stop();
+    Extras.resetForChat();
     filterMode = "all";
     filterQuery = "";
     chatSearch.value = "";
@@ -991,6 +961,7 @@ async function openProfile(username) {
   const name = $("profile-name");
   name.textContent = profile.username;
   name.style.color = readable(profile.nameColor);
+  $("profile-stars").textContent = `★ ${profile.stars || 0} star${profile.stars === 1 ? "" : "s"} received`;
   const bio = $("profile-bio");
   if (profile.bio) {
     bio.classList.remove("empty");
@@ -1518,6 +1489,7 @@ compose.addEventListener("submit", async (event) => {
   form.append("body", body);
   const emojiFx = Fx.textToFx(body);
   if (emojiFx) form.append("fx", JSON.stringify(emojiFx));
+  Extras.applySendOptions(form);
   for (const file of pendingFiles) form.append("files", file);
   composeInput.value = "";
   const sentFiles = pendingFiles;
@@ -1528,6 +1500,7 @@ compose.addEventListener("submit", async (event) => {
       method: "POST",
       body: form,
     });
+    Extras.clearSendOptions();
     if (isFiltering()) clearFilter();
     stickToBottom = true;
     upsertMessage(message);

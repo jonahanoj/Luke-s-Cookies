@@ -7,7 +7,13 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const YT = /^[A-Za-z0-9_-]{11}$/;
 const EMOJI_NAME = /^[A-Za-z0-9_]{1,32}$/;
 
-export const MAX_EFFECT_SECONDS = 10;
+import "../public/crumbs-engine.js";
+
+// Effects default to short clips, but people can make them as long as they
+// like (up to 10 minutes); everyone can skip them.
+export const MAX_EFFECT_SECONDS = 600;
+const SCREEN_KINDS = globalThis.CrumbsEngine.SCREEN_KINDS;
+const BOOM_STYLES = ["crumble", "melt", "explode"];
 const MAX_SPANS = 400;
 const MAX_TEXT = 2000;
 const MAX_OVERLAYS = 12;
@@ -87,14 +93,14 @@ export function sanitizeFx(raw, assetIds, existingIds = new Set()) {
     if (spans.length && styled) fx.spans = spans;
   }
 
+  const assetFor = (value) => {
+    if (typeof value === "string" && existingIds.has(value)) return value;
+    const index = typeof value === "number" ? value : NaN;
+    return Number.isInteger(index) && assetIds[index] ? assetIds[index] : null;
+  };
   const effect = raw.effect && typeof raw.effect === "object" ? raw.effect : null;
   if (effect) {
     const out = {};
-    const assetFor = (value) => {
-      if (typeof value === "string" && existingIds.has(value)) return value;
-      const index = typeof value === "number" ? value : NaN;
-      return Number.isInteger(index) && assetIds[index] ? assetIds[index] : null;
-    };
     if (Array.isArray(effect.overlays)) {
       const overlays = [];
       for (const item of effect.overlays.slice(0, MAX_OVERLAYS)) {
@@ -126,7 +132,49 @@ export function sanitizeFx(raw, assetIds, existingIds = new Set()) {
         if (a) out.music = { a, s: start, e: end, v: volume };
       }
     }
-    if (out.overlays || out.music) fx.effect = out;
+    if (Array.isArray(effect.screen)) {
+      const screen = [];
+      for (const item of effect.screen.slice(0, 12)) {
+        if (!item || !SCREEN_KINDS.includes(item.k)) continue;
+        const start = num(item.s, 0, MAX_EFFECT_SECONDS - 0.5, 0);
+        screen.push({ k: item.k, s: start, e: num(item.e, start + 0.5, MAX_EFFECT_SECONDS, start + 3) });
+      }
+      if (screen.length) out.screen = screen;
+    }
+    if (out.overlays || out.music || out.screen) fx.effect = out;
+  }
+
+  // Self-destructing message.
+  if (raw.boom && typeof raw.boom === "object") {
+    fx.boom = {
+      style: BOOM_STYLES.includes(raw.boom.style) ? raw.boom.style : "crumble",
+      secs: Math.round(num(raw.boom.secs, 1, 60, 5)),
+    };
+  }
+
+  // Poll.
+  if (raw.poll && typeof raw.poll === "object") {
+    const q = String(raw.poll.q || "").trim().slice(0, 200);
+    const options = (Array.isArray(raw.poll.options) ? raw.poll.options : [])
+      .map((o) => String(o || "").trim().slice(0, 80))
+      .filter(Boolean)
+      .slice(0, 10);
+    if (q && options.length >= 2) {
+      fx.poll = { q, options, multi: Boolean(raw.poll.multi), anon: Boolean(raw.poll.anon) };
+    }
+  }
+
+  // Shared theme.
+  if (raw.theme && typeof raw.theme === "object" && HEX.test(String(raw.theme.p || "")) && HEX.test(String(raw.theme.s || ""))) {
+    fx.theme = { p: raw.theme.p.toLowerCase(), s: raw.theme.s.toLowerCase() };
+    const bg = raw.theme.bg != null ? assetFor(raw.theme.bg) : null;
+    if (bg) fx.theme.bg = bg;
+  }
+
+  // Crumbs interactive card.
+  if (raw.crumb && typeof raw.crumb === "object") {
+    const crumb = globalThis.CrumbsEngine.sanitize(raw.crumb, assetFor);
+    if (crumb) fx.crumb = crumb;
   }
 
   if (raw.pack && typeof raw.pack === "object" && UUID.test(String(raw.pack.id || ""))) {
@@ -141,5 +189,7 @@ export function fxAssetIds(fx) {
   const ids = new Set();
   for (const overlay of fx?.effect?.overlays || []) ids.add(overlay.a);
   if (fx?.effect?.music?.a) ids.add(fx.effect.music.a);
+  if (fx?.theme?.bg) ids.add(fx.theme.bg);
+  for (const id of globalThis.CrumbsEngine.assetsOf(fx?.crumb)) ids.add(id);
   return ids;
 }
