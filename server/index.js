@@ -70,6 +70,7 @@ import {
   copyEmojiPack,
 } from "./db.js";
 import { sanitizeFx, spansToText, fxAssetIds } from "./fx.js";
+import { makeGifLoop } from "./gifloop.js";
 import { guessMime } from "./mime.js";
 import { processAvatar, processBackground, processEmoji } from "./image.js";
 import { initPush, pushPublicKey, sendPush } from "./push.js";
@@ -1212,6 +1213,9 @@ app.post(
       ...plainFiles.map(toAttachment("file")),
       ...keptFx.map(toAttachment("fx")),
     ];
+    for (const file of attachments) {
+      if (file.mime === "image/gif") makeGifLoop(attachmentPath(file.id));
+    }
     const message = await addMessage(
       conversation.id,
       req.user.id,
@@ -1389,6 +1393,23 @@ async function runWipe() {
 await initDb();
 await initPush();
 await runWipe();
+// Make GIFs that were uploaded before looping was added loop too.
+setTimeout(() => {
+  try {
+    let fixed = 0;
+    for (const name of fs.readdirSync(UPLOAD_DIR)) {
+      const full = attachmentPath(name);
+      const head = Buffer.alloc(3);
+      const fd = fs.openSync(full, "r");
+      fs.readSync(fd, head, 0, 3, 0);
+      fs.closeSync(fd);
+      if (head.toString("ascii") === "GIF" && makeGifLoop(full)) fixed += 1;
+    }
+    if (fixed) console.log(`Checked ${fixed} GIFs so they loop.`);
+  } catch (err) {
+    console.warn("GIF loop pass failed:", err.message);
+  }
+}, 5000);
 setInterval(runWipe, 15 * 60 * 1000);
 
 server.requestTimeout = 30 * 60 * 1000;

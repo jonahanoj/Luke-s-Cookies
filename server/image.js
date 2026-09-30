@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import sharp from "sharp";
 import { guessMime } from "./mime.js";
+import { makeGifLoop } from "./gifloop.js";
 
 export async function processAvatar(inputPath, outputPath, originalName, mime) {
   const type = guessMime(originalName, mime);
@@ -11,6 +12,7 @@ export async function processAvatar(inputPath, outputPath, originalName, mime) {
   }
   if (type === "image/gif") {
     if (inputPath !== outputPath) fs.renameSync(inputPath, outputPath);
+    makeGifLoop(outputPath);
     return type;
   }
   const tmp = `${outputPath}.tmp`;
@@ -83,7 +85,8 @@ export async function processEmoji(inputPath, outputPath, originalName, mime) {
     });
     const meta = await sharp(inputPath, { animated }).metadata();
     if ((meta.pages || 1) > 1) {
-      pipeline = type === "image/gif" ? pipeline.gif() : pipeline.webp({ quality: 85 });
+      pipeline =
+        type === "image/gif" ? pipeline.gif({ loop: 0 }) : pipeline.webp({ quality: 85, loop: 0 });
       outMime = type === "image/gif" ? "image/gif" : "image/webp";
     } else {
       pipeline = pipeline.png();
