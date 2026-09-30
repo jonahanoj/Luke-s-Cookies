@@ -360,20 +360,29 @@ const Fx = (() => {
     });
   }
 
+  // Images are kept as blobs. Each playback gets a fresh object URL, so a GIF
+  // always starts from its first frame (in sync with the music).
+  const imageBlobs = new Map(); // url -> Blob
+
   function prepareImage(url) {
     if (!warmImages.has(url)) {
-      const img = new Image();
-      img.src = url;
       warmImages.set(
         url,
-        (img.decode ? img.decode() : Promise.resolve()).catch(() => {})
+        fetch(url, { credentials: "same-origin" })
+          .then((res) => (res.ok ? res.blob() : null))
+          .then((blob) => {
+            if (blob) imageBlobs.set(url, blob);
+            return blob;
+          })
+          .catch(() => null)
       );
-      trimCache(warmImages, 40);
+      trimCache(warmImages, 40, () => {});
+      trimCache(imageBlobs, 40);
     }
     return warmImages.get(url);
   }
 
-  // Start loading everything an effect needs. Resolves when ready (or soon).
+  // Start loading everything an effect needs. Resolves when ready.
   function prepare(effect, urlFor) {
     if (!effect) return Promise.resolve();
     const jobs = (effect.overlays || []).map((o) => prepareImage(urlFor(o.a)));
@@ -395,11 +404,88 @@ const Fx = (() => {
     stop();
     if (!effect) return;
     const token = ++playToken;
-    // Wait for preloading (instant if it was already warmed up), but never
-    // hold things up for more than a moment.
-    await Promise.race([prepare(effect, urlFor), new Promise((r) => setTimeout(r, 2500))]);
+    // Wait for everything to load (instant if it was preloaded). Syncing
+    // matters more than speed, but don't wait forever on a broken link.
+    await Promise.race([prepare(effect, urlFor), new Promise((r) => setTimeout(r, 10000))]);
     if (token !== playToken) return;
     start(effect, urlFor);
+  }
+
+  // Calls onStart once the music is actually audible (or right away if there
+  // is no music, or after a few seconds if it never starts).
+  function startMusic(music, urlFor, state, onStart) {
+    let started = false;
+    const go = () => {
+      if (started || playing !== state) return;
+      started = true;
+      onStart();
+    };
+    state.timers.push(setTimeout(go, 6000));
+    const volume = music.v ?? 0.8;
+    if (music.yt) {
+      const entry = warmYt.get(`${music.yt}@${music.s}`);
+      const player = entry?.player;
+      if (!player?.playVideo) {
+        go();
+        return;
+      }
+      try {
+        player.seekTo(music.s, true);
+        player.setVolume(Math.round(volume * 100));
+        player.unMute();
+        player.playVideo();
+      } catch {
+        go();
+        return;
+      }
+      // Wait until the video clock is really moving past the start point.
+      const poll = setInterval(() => {
+        try {
+          const playingNow = player.getPlayerState?.() === 1;
+          if (playingNow && player.getCurrentTime() >= music.s) {
+            clearInterval(poll);
+            go();
+          }
+        } catch {
+          clearInterval(poll);
+          go();
+        }
+      }, 25);
+      state.cleanup.push(() => clearInterval(poll));
+      state.haltMusic = () => {
+        try {
+          player.pauseVideo();
+          player.mute();
+          player.seekTo(music.s, true);
+        } catch {
+          // ignore
+        }
+      };
+      state.cleanup.push(state.haltMusic);
+    } else if (music.a) {
+      const url = urlFor(music.a);
+      const audio = warmAudio.get(url) || new Audio(url);
+      audio.volume = volume;
+      try {
+        audio.currentTime = music.s || 0;
+      } catch {
+        // ignore
+      }
+      audio.addEventListener("playing", go, { once: true });
+      audio.play().catch(() => go());
+      state.haltMusic = () => {
+        audio.removeEventListener("playing", go);
+        audio.pause();
+        try {
+          audio.currentTime = music.s || 0;
+        } catch {
+          // ignore
+        }
+      };
+      state.cleanup.push(state.haltMusic);
+    } else {
+      go();
+    }
   }
 
   function start(effect, urlFor) {
@@ -408,82 +494,55 @@ const Fx = (() => {
     const state = { timers: [], cleanup: [] };
     playing = state;
     el.hidden = false;
-    requestAnimationFrame(() => el.classList.add("show"));
-    let total = 0;
     const frame = makeFrame();
     el.append(frame);
 
+    // Build the images now (hidden) so showing them costs nothing later.
+    const items = [];
     for (const overlay of effect.overlays || []) {
-      const img = document.createElement("img");
-      img.className = "fx-overlay";
-      img.src = urlFor(overlay.a);
-      img.alt = "";
-      placeOverlay(img, overlay);
-      frame.append(img);
-      const startAt = Math.max(0, overlay.s || 0) * 1000;
-      const end = Math.min(MAX_SECONDS, overlay.e || MAX_SECONDS) * 1000;
-      total = Math.max(total, end);
-      state.timers.push(setTimeout(() => img.classList.add("on"), startAt));
-      state.timers.push(setTimeout(() => img.classList.remove("on"), Math.max(startAt, end - 400)));
+      const url = urlFor(overlay.a);
+      const blob = imageBlobs.get(url);
+      const objectUrl = blob ? URL.createObjectURL(blob) : null;
+      if (objectUrl) state.cleanup.push(() => URL.revokeObjectURL(objectUrl));
+      items.push({ overlay, url: objectUrl || url });
     }
 
     const music = effect.music;
-    if (music) {
-      const length = Math.min(MAX_SECONDS, Math.max(0.5, music.e - music.s)) * 1000;
-      total = Math.max(total, length);
-      const volume = music.v ?? 0.8;
-      if (music.yt) {
-        const entry = warmYt.get(`${music.yt}@${music.s}`);
-        const player = entry?.player;
-        if (player?.playVideo) {
-          try {
-            player.seekTo(music.s, true);
-            player.setVolume(Math.round(volume * 100));
-            player.unMute();
-            player.playVideo();
-          } catch {
-            // ignore
-          }
-          const halt = () => {
-            try {
-              player.pauseVideo();
-              player.mute();
-              player.seekTo(music.s, true);
-            } catch {
-              // ignore
-            }
-          };
-          state.timers.push(setTimeout(halt, length));
-          state.cleanup.push(halt);
-        }
-      } else if (music.a) {
-        const url = urlFor(music.a);
-        const audio = warmAudio.get(url) || new Audio(url);
-        audio.volume = volume;
-        try {
-          audio.currentTime = music.s || 0;
-        } catch {
-          // ignore
-        }
-        audio.play().catch(() => {});
-        const halt = () => {
-          audio.pause();
-          try {
-            audio.currentTime = music.s || 0;
-          } catch {
-            // ignore
-          }
-        };
-        state.timers.push(setTimeout(halt, length));
-        state.cleanup.push(halt);
-      }
-    }
+    const musicLength = music ? Math.min(MAX_SECONDS, Math.max(0.5, music.e - music.s)) * 1000 : 0;
 
-    total = Math.min(MAX_SECONDS * 1000, Math.max(total, 500));
-    state.timers.push(setTimeout(() => el.classList.remove("show"), total - 300));
-    state.timers.push(setTimeout(() => {
-      if (playing === state) stop();
-    }, total));
+    const showVisuals = () => {
+      el.classList.add("show");
+      if (state.haltMusic) state.timers.push(setTimeout(state.haltMusic, musicLength));
+      let total = musicLength;
+      for (const { overlay, url } of items) {
+        const img = document.createElement("img");
+        img.className = "fx-overlay";
+        img.alt = "";
+        placeOverlay(img, overlay);
+        const startAt = Math.max(0, overlay.s || 0) * 1000;
+        const end = Math.min(MAX_SECONDS, overlay.e || MAX_SECONDS) * 1000;
+        total = Math.max(total, end);
+        // Set src only when it appears, so a GIF starts on its first frame.
+        state.timers.push(
+          setTimeout(() => {
+            img.src = url;
+            frame.append(img);
+            requestAnimationFrame(() => img.classList.add("on"));
+          }, startAt)
+        );
+        state.timers.push(setTimeout(() => img.classList.remove("on"), Math.max(startAt, end - 400)));
+      }
+      total = Math.min(MAX_SECONDS * 1000, Math.max(total, 500));
+      state.timers.push(setTimeout(() => el.classList.remove("show"), total - 300));
+      state.timers.push(
+        setTimeout(() => {
+          if (playing === state) stop();
+        }, total)
+      );
+    };
+
+    if (music) startMusic(music, urlFor, state, showVisuals);
+    else showVisuals();
   }
 
   function playMessage(message) {
