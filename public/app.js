@@ -322,8 +322,6 @@ function connectSocket() {
   socket = io();
   socket.on("connect", sendPresence);
   socket.on("message", (payload) => {
-    // Start loading effect media right away so it's ready when the chat opens.
-    if (payload.fx?.effect && !payload.mine) Fx.prewarm(payload);
     refreshConversations();
     if (payload.pinned || sideTab === "pinned") refreshPinned();
     if (payload.conversationId !== activeId) return;
@@ -771,7 +769,6 @@ async function loadMessages(conversationId) {
   for (const message of data.messages) upsertMessage(message);
   applyFilter();
   messagesEl.scrollTop = messagesEl.scrollHeight;
-  for (const message of data.messages.filter((m) => m.fx?.effect).slice(-3)) Fx.prewarm(message);
   Fx.autoplay(data.messages);
 }
 

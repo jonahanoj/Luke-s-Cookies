@@ -319,7 +319,7 @@ const Fx = (() => {
       )
       .catch(() => entry);
     warmYt.set(key, entry);
-    trimCache(warmYt, 6, (old) => {
+    trimCache(warmYt, 1, (old) => {
       try {
         old.player?.destroy();
       } catch {
@@ -337,7 +337,7 @@ const Fx = (() => {
       audio.src = url;
       audio.load();
       warmAudio.set(url, audio);
-      trimCache(warmAudio, 8, (old) => {
+      trimCache(warmAudio, 1, (old) => {
         old.pause();
         old.src = "";
       });
@@ -376,8 +376,8 @@ const Fx = (() => {
           })
           .catch(() => null)
       );
-      trimCache(warmImages, 40, () => {});
-      trimCache(imageBlobs, 40);
+      trimCache(warmImages, 12, () => {});
+      trimCache(imageBlobs, 12);
     }
     return warmImages.get(url);
   }
@@ -1732,9 +1732,6 @@ const Fx = (() => {
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && playing) stop();
   });
-
-  // Get the YouTube player code loading early so the first clip isn't slow.
-  setTimeout(() => loadYouTubeApi().catch(() => {}), 1500);
 
   return {
     Emoji,
