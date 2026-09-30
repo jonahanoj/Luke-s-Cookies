@@ -50,6 +50,13 @@
           </button>
           <button id="btn-settings" class="btn ghost small" type="button">Settings</button>
         </header>
+        <div id="notify-banner" class="notify-banner" hidden>
+          <span>🔔 Get a notification when someone messages you?</span>
+          <span class="notify-banner-btns">
+            <button id="notify-yes" class="btn primary small" type="button">Turn on</button>
+            <button id="notify-no" class="btn ghost small" type="button">Not now</button>
+          </span>
+        </div>
         <div id="wipe-banner" class="wipe-banner">Unpinned messages wipe every 2 weeks. Pin one to keep it.</div>
         <div class="side-tabs" role="tablist">
           <button id="side-tab-chats" class="side-tab active" type="button" role="tab">Chats</button>
@@ -233,6 +240,7 @@
             <span>Notify me about new messages on this device</span>
           </label>
           <p id="notify-status" class="hint"></p>
+          <button id="notify-test" class="btn ghost small" type="button" hidden>Send me a test notification</button>
         </section>
 
         <section class="settings-section">

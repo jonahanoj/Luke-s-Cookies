@@ -22,21 +22,50 @@ const Crumbs = (() => {
   }
 
   // opts: { assetUrl(id), onPress(el), now(), editing, selectedId, onSelect(el, event) }
+  // Existing element nodes are reused between redraws, so a click that's in
+  // progress while the card updates still counts.
   function draw(card, def, state, opts) {
-    card.replaceChildren();
     card.style.aspectRatio = String(E.ASPECTS[def.aspect] || 1);
     card.style.background = def.bg || "#fff7ec";
     card.classList.add("crumb-card");
+    const old = new Map();
+    for (const child of [...card.children]) {
+      if (child.dataset.el) old.set(child.dataset.el, child);
+      else child.remove();
+    }
+    const byId = new Map(def.elements.map((el) => [el.id, el]));
+    card.onclick =
+      !opts.editing && opts.onPress
+        ? (event) => {
+            const node = event.target.closest("[data-el]");
+            if (!node || !card.contains(node)) return;
+            event.stopPropagation();
+            opts.onPress(node.dataset.el, node);
+          }
+        : null;
+    card.onpointerdown = opts.editing
+      ? (event) => {
+          const node = event.target.closest("[data-el]");
+          if (node && card.contains(node) && byId.has(node.dataset.el)) opts.onSelect?.(byId.get(node.dataset.el), event, node);
+        }
+      : null;
+    let index = 0;
     for (const el of def.elements) {
       const visible = state.vis[el.id] !== false;
       if (!visible && !opts.editing) continue;
       const pos = state.pos?.[el.id];
-      const node = document.createElement(el.type === "button" ? "button" : "div");
-      if (el.type === "button") node.type = "button";
+      const tag = el.type === "button" ? "BUTTON" : "DIV";
+      let node = old.get(el.id);
+      if (node && node.tagName !== tag) node = null;
+      if (node) old.delete(el.id);
+      else {
+        node = document.createElement(tag);
+        if (el.type === "button") node.type = "button";
+        node.dataset.el = el.id;
+      }
       node.className = `crumb-el crumb-${el.type} shape-${el.shape}`;
       if (!visible) node.classList.add("crumb-hidden");
       if (opts.selectedId === el.id) node.classList.add("selected");
-      node.dataset.el = el.id;
       node.style.left = `${pos ? pos.x : el.x}%`;
       node.style.top = `${pos ? pos.y : el.y}%`;
       node.style.width = `${el.w}%`;
@@ -44,44 +73,46 @@ const Crumbs = (() => {
       node.style.setProperty("--s", el.size);
       node.style.color = el.textColor || "#1b1b1b";
       const fill = state.color?.[el.id] || el.color;
-      if (fill && el.type !== "image") node.style.background = fill;
+      node.style.background = fill && el.type !== "image" ? fill : "";
       const text = state.text?.[el.id] ?? el.text;
+      node.querySelector(".crumb-resize")?.remove();
       if (el.type === "image") {
-        const img = document.createElement("img");
-        img.src = opts.assetUrl(state.img?.[el.id] || el.asset);
-        img.alt = "";
-        img.draggable = false;
-        node.append(img);
-      } else if (el.type === "counter") {
-        node.textContent = `${text || ""}${state.num?.[el.id] ?? el.value ?? 0}`;
-      } else if (el.type === "timer") {
-        const end = state.timers?.[el.timer];
-        const timer = def.timers.find((t) => t.id === el.timer);
-        const left = end ? end - opts.now() : (timer?.secs || 0) * 1000;
-        node.textContent = `${text || ""}${fmtTimer(left)}`;
-        node.classList.toggle("running", Boolean(end));
+        const src = opts.assetUrl(state.img?.[el.id] || el.asset);
+        let img = node.querySelector("img");
+        if (!img || node.childNodes.length !== 1) {
+          node.replaceChildren();
+          img = document.createElement("img");
+          img.alt = "";
+          img.draggable = false;
+          node.append(img);
+        }
+        if (img.getAttribute("src") !== src) img.src = src;
       } else {
-        node.textContent = text;
+        let label = text;
+        if (el.type === "counter") label = `${text || ""}${state.num?.[el.id] ?? el.value ?? 0}`;
+        else if (el.type === "timer") {
+          const end = state.timers?.[el.timer];
+          const timer = def.timers.find((t) => t.id === el.timer);
+          const left = end ? end - opts.now() : (timer?.secs || 0) * 1000;
+          label = `${text || ""}${fmtTimer(left)}`;
+          node.classList.toggle("running", Boolean(end));
+        }
+        if (node.textContent !== (label ?? "") || node.children.length) node.textContent = label ?? "";
       }
       if (!opts.editing && opts.onPress) {
-        node.addEventListener("click", (event) => {
-          event.stopPropagation();
-          opts.onPress(el.id, node);
-        });
         const pressable = def.rules.some((r) => r.when.on === "press" && r.when.el === el.id);
         if (pressable) node.classList.add("pressable");
       }
-      if (opts.editing) {
-        node.addEventListener("pointerdown", (event) => opts.onSelect?.(el, event, node));
-        if (opts.selectedId === el.id) {
-          const handle = document.createElement("span");
-          handle.className = "crumb-resize";
-          handle.dataset.resize = "1";
-          node.append(handle);
-        }
+      if (opts.editing && opts.selectedId === el.id) {
+        const handle = document.createElement("span");
+        handle.className = "crumb-resize";
+        handle.dataset.resize = "1";
+        node.append(handle);
       }
-      card.append(node);
+      if (card.children[index] !== node) card.insertBefore(node, card.children[index] || null);
+      index += 1;
     }
+    for (const node of old.values()) node.remove();
   }
 
   // ---------- per-crumb mute (remembered on this device) ----------
@@ -136,14 +167,17 @@ const Crumbs = (() => {
     let entry = live.get(message.id);
     const incoming = message.crumbState;
     if (!entry) {
-      entry = { def: message.fx.crumb, state: incoming, offset: 0, cards: new Set(), tickSent: 0 };
+      entry = { def: message.fx.crumb, state: incoming, server: incoming, offset: 0, cards: new Set(), tickSent: 0, outbox: [] };
       live.set(message.id, entry);
     } else if (JSON.stringify(entry.def) !== JSON.stringify(message.fx.crumb)) {
       // The crumb was edited: start fresh with the new version.
       entry.def = message.fx.crumb;
       entry.state = incoming;
-    } else if (incoming && (incoming.seq || 0) >= (entry.state?.seq || 0)) {
-      entry.state = incoming;
+      entry.server = incoming;
+      entry.outbox = [];
+    } else if (incoming && (incoming.seq || 0) >= (entry.server?.seq || 0)) {
+      entry.server = incoming;
+      if (!entry.inflight && !entry.outbox?.length) entry.state = incoming;
     }
     if (message.serverNow) entry.offset = message.serverNow - Date.now();
     return entry;
@@ -166,40 +200,68 @@ const Crumbs = (() => {
     draw(card, entry.def, entry.state, {
       assetUrl: serverUrl,
       now: () => Date.now() + entry.offset,
-      onPress: (el) => send(id, { type: "press", el }),
+      onPress: (el) => press(id, { type: "press", el }),
     });
   }
 
-  async function send(id, event) {
+  // This tab's id, so we can ignore the echo of our own presses.
+  const tabId = Math.random().toString(36).slice(2, 12);
+
+  // Presses show up instantly here (we run the same rules locally), then get
+  // sent to the server in batches. The server's answer is the final word.
+  function press(id, event) {
+    const entry = live.get(id);
+    if (!entry) return;
+    const result = E.apply(entry.def, entry.state, event, Date.now() + entry.offset);
+    if (result.changed) {
+      entry.state = result.state;
+      redrawEntry(id);
+      playFired(result.fired, serverUrl, id);
+    }
+    entry.outbox = entry.outbox || [];
+    entry.outbox.push(event);
+    flush(id);
+  }
+
+  async function flush(id) {
+    const entry = live.get(id);
+    if (!entry || entry.inflight || !entry.outbox?.length) return;
+    const events = entry.outbox.splice(0, 60);
+    entry.inflight = true;
+    let data = null;
     try {
-      const data = await api(`/api/messages/${id}/crumb`, { method: "POST", body: { event } });
-      applyRemote(data, true);
+      data = await api(`/api/messages/${id}/crumb`, { method: "POST", body: { events, cid: tabId } });
     } catch (err) {
       showError(composeError, err.message);
     }
-  }
-
-  function applyRemote(payload, fromMe = false) {
-    const entry = live.get(payload.messageId);
-    if (!entry) return;
-    if ((payload.state.seq || 0) < (entry.state?.seq || 0)) return;
-    const changed = (payload.state.seq || 0) !== (entry.state?.seq || 0);
-    entry.state = payload.state;
-    if (payload.serverNow) entry.offset = payload.serverNow - Date.now();
-    redrawEntry(payload.messageId);
-    // Everyone gets the screen effects/sounds once (the socket event), not twice.
-    if (changed && !fromMe) playFired(payload.fired, serverUrl, payload.messageId);
-    else if (changed && fromMe) {
-      entry.lastFiredSeq = payload.state.seq;
-      playFired(payload.fired, serverUrl, payload.messageId);
+    entry.inflight = false;
+    if (data) {
+      if (data.serverNow) entry.offset = data.serverNow - Date.now();
+      if (!entry.server || (data.state.seq || 0) >= (entry.server.seq || 0)) entry.server = data.state;
+    }
+    if (entry.outbox.length) {
+      flush(id);
+      return;
+    }
+    // Nothing else waiting: line up with the server exactly.
+    if (entry.server && JSON.stringify(entry.server) !== JSON.stringify(entry.state)) {
+      entry.state = entry.server;
+      redrawEntry(id);
     }
   }
 
   function onRemoteState(payload) {
     const entry = live.get(payload.messageId);
     if (!entry) return;
-    if (entry.lastFiredSeq === payload.state.seq) return; // already handled from our own press
-    applyRemote(payload);
+    if (payload.cid && payload.cid === tabId) return; // our own press, already shown
+    if ((payload.state.seq || 0) < (entry.server?.seq || 0)) return;
+    entry.server = payload.state;
+    if (payload.serverNow) entry.offset = payload.serverNow - Date.now();
+    playFired(payload.fired, serverUrl, payload.messageId);
+    // If we're mid-click, our next server answer will include this anyway.
+    if (entry.inflight || entry.outbox?.length) return;
+    entry.state = payload.state;
+    redrawEntry(payload.messageId);
   }
 
   function renderCard(message) {
@@ -254,7 +316,7 @@ const Crumbs = (() => {
       const now = Date.now() + entry.offset;
       if (due <= now && Date.now() - entry.tickSent > 1500) {
         entry.tickSent = Date.now();
-        send(id, { type: "tick" });
+        press(id, { type: "tick" });
       }
     }
   }, 250);

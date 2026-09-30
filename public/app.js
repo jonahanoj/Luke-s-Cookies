@@ -269,18 +269,64 @@ async function disableNotifications() {
   await sub.unsubscribe().catch(() => {});
 }
 
-// Keep the server's copy of this device's subscription tied to whoever is logged in.
+// Keep the server's copy of this device's subscription tied to whoever is
+// logged in. If notifications are allowed but this device isn't subscribed
+// yet (or the browser dropped it), subscribe again automatically.
 async function syncSubscription() {
   try {
-    if (!pushSupported() || Notification.permission !== "granted") return;
-    const sub = await currentSubscription();
-    if (sub) {
-      await api("/api/push/subscribe", { method: "POST", body: { subscription: sub.toJSON() } });
+    if (!pushSupported()) return;
+    if (Notification.permission === "granted") {
+      if (localStorage.getItem("lc-notify-off") === "1") return; // they turned it off here
+      await enableNotifications();
+      return;
     }
+    if (Notification.permission === "default") maybeShowNotifyBanner();
   } catch {
     // not fatal
   }
 }
+
+// Ask (nicely) to turn notifications on. Browsers only allow the permission
+// popup right after a tap, so this is a banner with a button.
+function maybeShowNotifyBanner() {
+  let snoozed = 0;
+  try {
+    snoozed = Number(localStorage.getItem("lc-notify-snooze")) || 0;
+  } catch {}
+  if (Date.now() < snoozed) return;
+  $("notify-banner").hidden = false;
+}
+
+$("notify-yes").addEventListener("click", async () => {
+  $("notify-banner").hidden = true;
+  try {
+    localStorage.removeItem("lc-notify-off");
+    await enableNotifications();
+  } catch (err) {
+    $("notify-banner").hidden = false;
+    $("notify-banner").firstElementChild.textContent = err.message;
+  }
+  refreshNotifyUi().catch(() => {});
+});
+
+$("notify-no").addEventListener("click", () => {
+  $("notify-banner").hidden = true;
+  try {
+    localStorage.setItem("lc-notify-snooze", String(Date.now() + 3 * 24 * 3600 * 1000));
+  } catch {}
+});
+
+$("notify-test").addEventListener("click", async () => {
+  const status = $("notify-status");
+  try {
+    const result = await api("/api/push/test", { method: "POST" });
+    status.textContent = result.sent
+      ? `Sent to ${result.sent} device${result.sent === 1 ? "" : "s"}. It should pop up in a few seconds.`
+      : "No devices have notifications turned on yet.";
+  } catch (err) {
+    status.textContent = err.message;
+  }
+});
 
 async function refreshNotifyUi() {
   const toggle = $("notify-toggle");
@@ -297,6 +343,7 @@ async function refreshNotifyUi() {
   toggle.disabled = false;
   const sub = await currentSubscription().catch(() => null);
   toggle.checked = Boolean(sub) && Notification.permission === "granted";
+  $("notify-test").hidden = !toggle.checked;
   if (Notification.permission === "denied") {
     status.textContent = "Blocked in your browser settings for this site.";
   } else if (toggle.checked) {
@@ -418,7 +465,9 @@ function renderConversations() {
   for (const item of conversations) {
     const button = document.createElement("button");
     button.type = "button";
-    button.className = "conversation" + (item.id === activeId ? " active" : "");
+    if (item.id === activeId && document.visibilityState === "visible") item.unread = 0; // you're looking at it
+    button.className =
+      "conversation" + (item.id === activeId ? " active" : "") + (item.unread ? " unread" : "");
     const avatar = document.createElement("img");
     avatar.className = "list-avatar";
     avatar.src = item.avatarUrl || "/assets/SmallLogo.png";
@@ -439,15 +488,35 @@ function renderConversations() {
     preview.textContent = item.blocked ? "Blocked" : item.lastMessage || "No messages yet";
     copy.append(name, preview);
     button.append(avatar, copy);
+    if (item.unread) {
+      const badge = document.createElement("span");
+      badge.className = "unread-badge";
+      badge.textContent = item.unread > 99 ? "99+" : String(item.unread);
+      badge.setAttribute("aria-label", `${item.unread} unread`);
+      button.append(badge);
+    }
     button.addEventListener("click", () => openConversation(item));
     conversationList.append(button);
   }
 }
 
+function paintUnreadTitle() {
+  const total = conversations.reduce((sum, item) => sum + (item.muted ? 0 : item.unread || 0), 0);
+  document.title = total ? `(${total > 99 ? "99+" : total}) Luke's Cookies` : "Luke's Cookies";
+  navigator.setAppBadge?.(total).catch?.(() => {});
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible" || !conversations?.length) return;
+  renderConversations();
+  paintUnreadTitle();
+});
+
 async function refreshConversations() {
   const data = await api("/api/conversations");
   conversations = data.conversations;
   renderConversations();
+  paintUnreadTitle();
   if (activeId) {
     const current = conversations.find((item) => item.id === activeId);
     if (current) {
@@ -778,6 +847,9 @@ async function openConversation(item) {
   const switching = activeId !== item.id;
   activeId = item.id;
   activeChat = item;
+  item.unread = 0;
+  renderConversations();
+  paintUnreadTitle();
   appEl.classList.add("show-chat");
   emptyChat.hidden = true;
   thread.hidden = false;
@@ -1262,8 +1334,14 @@ $("notify-toggle").addEventListener("change", async (event) => {
   const on = event.target.checked;
   event.target.disabled = true;
   try {
-    if (on) await enableNotifications();
-    else await disableNotifications();
+    if (on) {
+      localStorage.removeItem("lc-notify-off");
+      await enableNotifications();
+      $("notify-banner").hidden = true;
+    } else {
+      localStorage.setItem("lc-notify-off", "1");
+      await disableNotifications();
+    }
   } catch (err) {
     status.textContent = err.message;
     event.target.disabled = false;

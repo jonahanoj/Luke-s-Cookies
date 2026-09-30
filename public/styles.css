@@ -386,6 +386,30 @@ textarea:focus {
   white-space: nowrap;
 }
 
+/* Chats with messages you haven't read yet */
+.conversation.unread .name {
+  font-weight: 800;
+}
+
+.conversation.unread .preview {
+  color: var(--ink);
+  font-weight: 700;
+}
+
+.unread-badge {
+  flex: none;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 6px;
+  border-radius: 11px;
+  background: var(--accent);
+  color: var(--accent-ink, #fff);
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 22px;
+  text-align: center;
+}
+
 .tag {
   display: inline-block;
   margin-left: 6px;
@@ -3504,4 +3528,34 @@ html.scr-shake {
 @keyframes cb-flash {
   0%, 30% { box-shadow: 0 0 0 3px var(--accent); }
   100% { box-shadow: none; }
+}
+
+/* "Turn on notifications?" banner in the sidebar */
+.notify-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--tan);
+  border-bottom: 1px solid var(--line);
+  font-size: 14px;
+}
+
+.notify-banner[hidden] {
+  display: none;
+}
+
+.notify-banner > span:first-child {
+  flex: 1 1 180px;
+}
+
+.notify-banner-btns {
+  display: flex;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+#notify-test {
+  margin-top: 6px;
 }

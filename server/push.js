@@ -39,10 +39,12 @@ export async function sendPush(userId, payload) {
   if (!ready) return;
   const subs = await pushSubscriptionsFor(userId);
   const body = JSON.stringify(payload);
+  let sent = 0;
   await Promise.all(
     subs.map(async (sub) => {
       try {
         await webpush.sendNotification(sub, body, { TTL: 60 * 60 * 24, urgency: "high" });
+        sent += 1;
       } catch (err) {
         if (err.statusCode === 404 || err.statusCode === 410) {
           await removePushSubscription(sub.endpoint);
@@ -52,4 +54,5 @@ export async function sendPush(userId, payload) {
       }
     })
   );
+  return { devices: subs.length, sent };
 }
