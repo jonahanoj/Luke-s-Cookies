@@ -1514,7 +1514,7 @@ app.patch(
       removeFiles(fxFiles);
       return;
     }
-    if (message.fx?.poll || message.fx?.crumb || message.fx?.roulette || message.fx?.theme || message.fx?.pack) {
+    if (message.fx?.poll || message.fx?.roulette || message.fx?.theme || message.fx?.pack) {
       removeFiles(fxFiles);
       res.status(400).json({ error: "This kind of message can't be edited." });
       return;
@@ -1554,7 +1554,19 @@ app.patch(
       if (file.mime === "image/gif") makeGifLoop(attachmentPath(file.id));
     }
     const keep = new Set([...used].filter((id) => existing.has(id)));
+    if (message.fx?.crumb && !fx?.crumb) {
+      removeFiles(keptNew);
+      res.status(400).json({ error: "A crumb needs at least one thing on it." });
+      return;
+    }
     const updated = await editMessage(message.id, body, fx, newFiles, keep);
+    if (fx?.crumb) {
+      // Edited crumbs start over with the new version.
+      const fresh = globalThis.CrumbsEngine.initialState(fx.crumb);
+      fresh.seq = (message.crumb_state?.seq || 0) + 1;
+      await setCrumbState(message.id, fresh);
+      updated.crumb_state = fresh;
+    }
     await emitMessageUpdated(conversation, updated);
     res.json(publicMessage(updated, req.user.id));
   }

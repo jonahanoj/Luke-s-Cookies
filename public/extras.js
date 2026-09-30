@@ -169,6 +169,7 @@ const Extras = (() => {
       if (message.pinned) item("📌 Unpin", () => pinMessage(message, false));
       else if (!tooBig) item("📌 Pin (keep past the wipe)", () => pinMessage(message, true));
       if (message.mine && !special) item("✏️ Edit", () => Fx.openEditForMessage(message));
+      if (message.mine && message.fx?.crumb) item("✏️ Edit crumb", () => Crumbs.openEdit(message));
       if (message.mine) item("🗑 Delete", () => deleteMessage(message, false), true);
     } else if (message.mine) {
       item("🗑 Remove", () => deleteMessage(message, false), true);

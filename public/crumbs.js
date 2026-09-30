@@ -104,6 +104,10 @@ const Crumbs = (() => {
     if (!entry) {
       entry = { def: message.fx.crumb, state: incoming, offset: 0, cards: new Set(), tickSent: 0 };
       live.set(message.id, entry);
+    } else if (JSON.stringify(entry.def) !== JSON.stringify(message.fx.crumb)) {
+      // The crumb was edited: start fresh with the new version.
+      entry.def = message.fx.crumb;
+      entry.state = incoming;
     } else if (incoming && (incoming.seq || 0) >= (entry.state?.seq || 0)) {
       entry.state = incoming;
     }
@@ -206,6 +210,7 @@ const Crumbs = (() => {
   const errorEl = $("cb-error");
   let def = null;
   let selected = null;
+  let editingId = null; // message id when editing a sent crumb
   let assets = new Map(); // local key -> { file, url }
   let nextId = 1;
   let assetCallback = null;
@@ -221,7 +226,9 @@ const Crumbs = (() => {
 
   function openBuilder() {
     if (!activeId) return;
+    if (editingId) resetBuilder(); // a half-done edit shouldn't leak into a new crumb
     if (!def) def = freshDef();
+    paintMode();
     $("cb-title").value = def.title;
     $("cb-aspect").value = def.aspect;
     $("cb-bg").value = def.bg;
@@ -231,10 +238,38 @@ const Crumbs = (() => {
   }
 
   function resetBuilder() {
-    for (const a of assets.values()) URL.revokeObjectURL(a.url);
+    for (const a of assets.values()) if (a.file) URL.revokeObjectURL(a.url);
     assets = new Map();
     def = null;
     selected = null;
+    editingId = null;
+    paintMode();
+  }
+
+  function paintMode() {
+    $("cb-send").textContent = editingId ? "Save changes" : "Send crumb";
+  }
+
+  // Open a crumb you already sent, change it, and save it in place.
+  function openEdit(message) {
+    if (!message?.fx?.crumb) return;
+    resetBuilder();
+    editingId = message.id;
+    def = JSON.parse(JSON.stringify(message.fx.crumb));
+    // Images/sounds already on the server are kept by their id.
+    const existing = new Set();
+    for (const el of def.elements) if (el.asset) existing.add(el.asset);
+    for (const rule of def.rules) for (const a of rule.do) if (a.asset) existing.add(a.asset);
+    for (const id of existing) assets.set(id, { file: null, url: `/api/attachments/${id}`, existing: true });
+    // Keep new ids from clashing with the old ones.
+    nextId = def.elements.length + def.timers.length + 50;
+    $("cb-title").value = def.title || "";
+    $("cb-aspect").value = def.aspect;
+    $("cb-bg").value = def.bg || "#fff7ec";
+    showError(errorEl, "");
+    paintMode();
+    setTab("build");
+    dialog.showModal();
   }
 
   function setTab(tab) {
@@ -323,84 +358,8 @@ const Crumbs = (() => {
     paintStage();
   }
 
-  // Ready-made example: tic-tac-toe that takes turns X, O, X, O…
-  function ticTacToe() {
-    const els = [
-      { id: "status", type: "text", x: 5, y: 3, w: 90, h: 9, text: "X's turn", size: 22, textColor: "#1b1b1b", shape: "rounded" },
-    ];
-    for (let r = 0; r < 3; r += 1) {
-      for (let c = 0; c < 3; c += 1) {
-        els.push({
-          id: `sq${r * 3 + c}`,
-          type: "button",
-          x: 11 + c * 27,
-          y: 14 + r * 21,
-          w: 25,
-          h: 19,
-          text: "",
-          color: "#ffffff",
-          textColor: "#1b1b1b",
-          size: 44,
-          shape: "rounded",
-        });
-      }
-    }
-    els.push({ id: "again", type: "button", x: 30, y: 84, w: 40, h: 10, text: "New game", color: "#4d9dff", textColor: "#ffffff", size: 16, shape: "pill" });
-    const rules = [
-      {
-        when: { on: "start" },
-        do: [
-          { a: "text", el: "status", text: "X's turn" },
-          { a: "wait", el: "*", blank: true },
-          { a: "text", el: "@pressed", text: "X" },
-          { a: "color", el: "@pressed", color: "#ffd6e0" },
-          { a: "text", el: "status", text: "O's turn" },
-          { a: "wait", el: "*", blank: true },
-          { a: "text", el: "@pressed", text: "O" },
-          { a: "color", el: "@pressed", color: "#d6e8ff" },
-          { a: "loop" },
-        ],
-      },
-      {
-        when: { on: "after" },
-        if: [...Array(9)].map((_, i) => ({ k: "text", el: `sq${i}`, op: "!=", v: "" })),
-        do: [{ a: "text", el: "status", text: "It's a draw!" }, { a: "halt" }],
-      },
-    ];
-    const lines = [
-      [0, 1, 2], [3, 4, 5], [6, 7, 8],
-      [0, 3, 6], [1, 4, 7], [2, 5, 8],
-      [0, 4, 8], [2, 4, 6],
-    ];
-    for (const player of ["X", "O"]) {
-      for (const line of lines) {
-        rules.push({
-          when: { on: "after" },
-          if: line.map((i) => ({ k: "text", el: `sq${i}`, op: "==", v: player })),
-          do: [
-            { a: "text", el: "status", text: `${player} wins! 🎉` },
-            { a: "halt" },
-            { a: "screen", kind: "shake", secs: 1 },
-          ],
-        });
-      }
-    }
-    rules.push({ when: { on: "press", el: "again" }, do: [{ a: "reset" }] });
-    def = { title: "Tic-tac-toe", aspect: "tall", bg: "#fff7ec", elements: els, timers: [], rules };
-    $("cb-title").value = def.title;
-    $("cb-aspect").value = def.aspect;
-    $("cb-bg").value = def.bg;
-    selected = null;
-    paintStage();
-  }
-
   dialog.querySelector(".cb-add").addEventListener("click", (event) => {
     const type = event.target.closest("[data-add]")?.dataset.add;
-    if (event.target.closest("[data-template]")) {
-      if (def.elements.length && !confirm("Replace what you've built with the tic-tac-toe example?")) return;
-      ticTacToe();
-      return;
-    }
     if (!type) return;
     if (type === "image") pickImage((key) => addElement("image", key));
     else addElement(type);
@@ -739,7 +698,19 @@ const Crumbs = (() => {
       def.rules.splice(index, 1);
       paintRules();
     });
-    whenRow.append(del);
+    const dup = document.createElement("button");
+    dup.type = "button";
+    dup.className = "cb-dup";
+    dup.textContent = "⧉ Duplicate";
+    dup.title = "Make a copy of this rule right below it";
+    dup.addEventListener("click", () => {
+      def.rules.splice(index + 1, 0, JSON.parse(JSON.stringify(rule)));
+      paintRules();
+      const copy = $("cb-rule-list").children[index + 1];
+      copy?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      copy?.classList.add("cb-flash");
+    });
+    whenRow.append(dup, del);
     card.append(whenRow);
     (rule.if || []).forEach((cond, i) => card.append(condRow(rule, cond, i)));
     const addIf = document.createElement("button");
@@ -948,7 +919,16 @@ const Crumbs = (() => {
       rule.do.splice(index, 1);
       paintRules();
     });
-    row.append(x);
+    const copyStep = document.createElement("button");
+    copyStep.type = "button";
+    copyStep.className = "cb-dup small";
+    copyStep.textContent = "⧉";
+    copyStep.title = "Duplicate this step";
+    copyStep.addEventListener("click", () => {
+      rule.do.splice(index + 1, 0, JSON.parse(JSON.stringify(action)));
+      paintRules();
+    });
+    row.append(copyStep, x);
     return row;
   }
 
@@ -1016,10 +996,11 @@ const Crumbs = (() => {
       showError(errorEl, "Add at least one thing to your crumb.");
       return;
     }
-    // Local asset keys → upload order.
+    // Local asset keys → upload order (images already sent keep their id).
     const files = [];
     const index = new Map();
     const toIndex = (key) => {
+      if (assets.get(key)?.existing) return key;
       if (!index.has(key)) {
         index.set(key, files.length);
         files.push(assets.get(key).file);
@@ -1031,9 +1012,19 @@ const Crumbs = (() => {
     for (const rule of payload.rules) for (const a of rule.do) if (a.asset) a.asset = toIndex(a.asset);
     const button = $("cb-send");
     button.disabled = true;
-    button.textContent = "Sending…";
+    button.textContent = editingId ? "Saving…" : "Sending…";
+    const body = clean.title ? `🍪 ${clean.title}` : "🍪 Crumb";
     try {
-      await Fx.sendFx({ crumb: payload }, files, clean.title ? `🍪 ${clean.title}` : "🍪 Crumb");
+      if (editingId) {
+        const form = new FormData();
+        form.append("body", body);
+        form.append("fx", JSON.stringify({ crumb: payload }));
+        for (const file of files) form.append("fxfiles", file);
+        const updated = await api(`/api/messages/${editingId}`, { method: "PATCH", body: form });
+        upsertMessage(updated, true);
+      } else {
+        await Fx.sendFx({ crumb: payload }, files, body);
+      }
       stopTest();
       dialog.close();
       resetBuilder();
@@ -1041,11 +1032,11 @@ const Crumbs = (() => {
       showError(errorEl, err.message);
     } finally {
       button.disabled = false;
-      button.textContent = "Send crumb";
+      paintMode();
     }
   });
 
   dialog.addEventListener("close", stopTest);
 
-  return { openBuilder, renderCard, onRemoteState };
+  return { openBuilder, openEdit, renderCard, onRemoteState };
 })();
