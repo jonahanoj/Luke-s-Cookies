@@ -1863,7 +1863,11 @@ app.post("/api/messages/:id/crumb", requireUser, async (req, res) => {
   const events = raw
     .slice(0, 60)
     .filter((event) => event && ["press", "tick"].includes(event.type))
-    .map((event) => ({ type: event.type, el: String(event.el || "") }));
+    .map((event) => {
+      const clean = { type: event.type, el: String(event.el || "") };
+      if (Number.isInteger(event.cell)) clean.cell = event.cell;
+      return clean;
+    });
   if (!events.length) {
     res.status(400).json({ error: "Unknown action." });
     return;

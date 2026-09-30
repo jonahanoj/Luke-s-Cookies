@@ -11,6 +11,7 @@ const Crumbs = (() => {
     counter: "Counter",
     timer: "Timer display",
     box: "Box",
+    grid: "Grid",
   };
 
   // ---------- drawing a crumb ----------
@@ -40,7 +41,8 @@ const Crumbs = (() => {
             const node = event.target.closest("[data-el]");
             if (!node || !card.contains(node)) return;
             event.stopPropagation();
-            opts.onPress(node.dataset.el, node);
+            const cell = event.target.closest("[data-cell]");
+            opts.onPress(node.dataset.el, node, cell ? Number(cell.dataset.cell) : undefined);
           }
         : null;
     card.onpointerdown = opts.editing
@@ -76,6 +78,40 @@ const Crumbs = (() => {
       node.style.background = fill && el.type !== "image" ? fill : "";
       const text = state.text?.[el.id] ?? el.text;
       node.querySelector(".crumb-resize")?.remove();
+      node.classList.toggle("crumb-off", Boolean(state.off?.[el.id]));
+      if (el.type === "grid") {
+        // A board of cells. Each cell shows its value (X, O, 🔴, …).
+        const list = state.grid?.[el.id] || el.cells || Array(el.cols * el.rows).fill("");
+        node.style.setProperty("--cols", el.cols);
+        node.style.setProperty("--rows", el.rows);
+        node.style.background = el.lines || "#3b2a1a";
+        const total = el.cols * el.rows;
+        if (node.children.length !== total || node.querySelector(":scope > :not(.crumb-cell)")) {
+          node.replaceChildren();
+          for (let i = 0; i < total; i += 1) {
+            const cell = document.createElement(opts.editing ? "div" : "button");
+            if (!opts.editing) cell.type = "button";
+            cell.className = "crumb-cell";
+            cell.dataset.cell = String(i);
+            node.append(cell);
+          }
+        }
+        [...node.children].forEach((cell, i) => {
+          const v = list[i] || "";
+          if (cell.textContent !== v) cell.textContent = v;
+          cell.style.background = el.color || "#ffe2b8";
+          cell.classList.toggle("filled", Boolean(v));
+        });
+        if (opts.editing && opts.selectedId === el.id) {
+          const handle = document.createElement("span");
+          handle.className = "crumb-resize";
+          handle.dataset.resize = "1";
+          node.append(handle);
+        }
+        if (card.children[index] !== node) card.insertBefore(node, card.children[index] || null);
+        index += 1;
+        continue;
+      }
       if (el.type === "image") {
         const src = opts.assetUrl(state.img?.[el.id] || el.asset);
         let img = node.querySelector("img");
@@ -200,7 +236,7 @@ const Crumbs = (() => {
     draw(card, entry.def, entry.state, {
       assetUrl: serverUrl,
       now: () => Date.now() + entry.offset,
-      onPress: (el) => press(id, { type: "press", el }),
+      onPress: (el, node, cell) => press(id, cell === undefined ? { type: "press", el } : { type: "press", el, cell }),
     });
   }
 
@@ -429,6 +465,7 @@ const Crumbs = (() => {
       counter: [34, 14],
       timer: [34, 14],
       box: [40, 30],
+      grid: [80, 70],
     };
     const [w, h] = sizes[type];
     const count = def.elements.length;
@@ -441,13 +478,20 @@ const Crumbs = (() => {
       h,
       hidden: false,
       text: type === "button" ? "Press me" : type === "text" ? "Some text" : type === "counter" ? "Score: " : "",
-      color: type === "button" ? "#e0457b" : type === "box" ? "#4d9dff" : null,
+      color: type === "button" ? "#e0457b" : type === "box" ? "#4d9dff" : type === "grid" ? "#ffe2b8" : null,
       textColor: type === "button" ? "#ffffff" : "#1b1b1b",
-      size: type === "text" ? 18 : 16,
+      size: type === "text" ? 18 : type === "grid" ? 28 : 16,
       shape: type === "button" ? "pill" : "rounded",
     };
     if (type === "image") el.asset = asset;
     if (type === "counter") el.value = 0;
+    if (type === "grid") {
+      el.cols = 3;
+      el.rows = 3;
+      el.lines = "#3b2a1a";
+      el.x = 10;
+      el.y = 15;
+    }
     if (type === "timer") {
       if (!def.timers.length) def.timers.push({ id: uid("t"), name: "Timer 1", secs: 10 });
       el.timer = def.timers[0].id;
@@ -586,7 +630,25 @@ const Crumbs = (() => {
     props.append(head);
     const grid = document.createElement("div");
     grid.className = "cb-props-grid";
-    if (el.type !== "image" && el.type !== "box") {
+    if (el.type === "grid") {
+      const resize = () => {
+        el.cols = Math.max(1, Math.min(12, Math.round(el.cols) || 3));
+        el.rows = Math.max(1, Math.min(12, Math.round(el.rows) || 3));
+        redrawSoon();
+      };
+      const cols = inputEl("number", el.cols, (v) => (el.cols = v), { min: 1, max: 12, className: "cb-num" });
+      const rows = inputEl("number", el.rows, (v) => (el.rows = v), { min: 1, max: 12, className: "cb-num" });
+      cols.addEventListener("change", resize);
+      rows.addEventListener("change", resize);
+      grid.append(field("Columns", cols), field("Rows", rows));
+      grid.append(
+        field("Line color", inputEl("color", el.lines || "#3b2a1a", (v) => {
+          el.lines = v;
+          redrawCard();
+        }))
+      );
+    }
+    if (el.type !== "image" && el.type !== "box" && el.type !== "grid") {
       const label = el.type === "counter" || el.type === "timer" ? "Label before the number" : "Text";
       const input = inputEl("text", el.text, (v) => {
         el.text = v;
@@ -612,7 +674,7 @@ const Crumbs = (() => {
     }
     if (el.type !== "image") {
       grid.append(
-        field("Color", inputEl("color", el.color || "#ffffff", (v) => {
+        field(el.type === "grid" ? "Cell color" : "Color", inputEl("color", el.color || "#ffffff", (v) => {
           el.color = v;
           redrawCard();
         }))
@@ -628,7 +690,7 @@ const Crumbs = (() => {
         redrawCard();
       }, { min: 8, max: 72 });
       grid.append(field("Text size", size));
-      grid.append(
+      if (el.type !== "grid") grid.append(
         field(
           "Shape",
           selectEl(
@@ -659,6 +721,11 @@ const Crumbs = (() => {
       );
       grid.append(change);
     }
+    const group = inputEl("text", el.group || "", (v) => {
+      el.group = v.replace(/[^A-Za-z0-9 _-]/g, "").slice(0, 24).trim() || undefined;
+    }, { maxLength: 24, placeholder: "e.g. coins" });
+    group.title = "Things in the same group can share one rule (like “when any coin is pressed”).";
+    grid.append(field("Group (optional)", group));
     grid.append(
       field("Starts hidden", inputEl("checkbox", el.hidden, (v) => {
         el.hidden = v;
@@ -697,6 +764,7 @@ const Crumbs = (() => {
   const elName = (id) => {
     if (id === "@pressed") return "the pressed one";
     if (id === "*") return "anything";
+    if (typeof id === "string" && id.startsWith("group:")) return `everything in “${id.slice(6)}”`;
     const el = def.elements.find((item) => item.id === id);
     if (!el) return id;
     const text = (el.text || "").trim();
@@ -712,10 +780,12 @@ const Crumbs = (() => {
       row.className = "cb-timer";
       row.append(
         inputEl("text", t.name, (v) => (t.name = v), { maxLength: 30, placeholder: "Name" }),
-        inputEl("number", t.secs, (v) => (t.secs = Math.max(0.5, v || 1)), { min: 0.5, max: 3600, step: 0.5 })
+        inputEl("number", t.secs, (v) => (t.secs = Math.max(0.1, v || 1)), { min: 0.1, max: 3600, step: 0.1 })
       );
       const secs = document.createElement("span");
       secs.textContent = "seconds";
+      const repeat = field("repeat", inputEl("checkbox", t.repeat, (v) => (t.repeat = v || undefined)));
+      repeat.title = "Starts itself again every time it finishes";
       const x = document.createElement("button");
       x.type = "button";
       x.className = "bar-x";
@@ -724,7 +794,7 @@ const Crumbs = (() => {
         def.timers = def.timers.filter((item) => item !== t);
         paintRules();
       });
-      row.append(secs, x);
+      row.append(secs, repeat, x);
       tl.append(row);
     }
     // rules
@@ -739,8 +809,16 @@ const Crumbs = (() => {
     def.rules.forEach((rule, index) => list.append(ruleCard(rule, index)));
   }
 
+  const groupNames = () => [...new Set(def.elements.map((el) => el.group).filter(Boolean))];
+  const groupOpts = () => groupNames().map((g) => [`group:${g}`, `anything in group “${g}”`]);
+
   function triggerOptions() {
-    const opts = def.elements.map((el) => [`press:${el.id}`, `${elName(el.id)} is pressed`]);
+    const opts = def.elements.map((el) => [
+      `press:${el.id}`,
+      el.type === "grid" ? `a cell of ${elName(el.id)} is pressed` : `${elName(el.id)} is pressed`,
+    ]);
+    for (const g of groupNames()) opts.push([`press:group:${g}`, `anything in group “${g}” is pressed`]);
+    opts.push(["touch", "two things touch"]);
     for (const t of def.timers) opts.push([`timer:${t.id}`, `timer “${t.name}” finishes`]);
     for (const el of def.elements.filter((item) => item.type === "counter")) {
       opts.push([`count:${el.id}`, `${elName(el.id)} reaches a number`]);
@@ -758,7 +836,9 @@ const Crumbs = (() => {
     const whenLabel = document.createElement("b");
     whenLabel.textContent = "When";
     const key =
-      rule.when.on === "press"
+      rule.when.on === "touch"
+        ? "touch"
+        : rule.when.on === "press"
         ? `press:${rule.when.el}`
         : rule.when.on === "timer"
           ? `timer:${rule.when.timer}`
@@ -768,7 +848,14 @@ const Crumbs = (() => {
               ? "after"
               : "start";
     const trig = selectEl(triggerOptions(), key, (v) => {
-      const [on, id] = v.split(":");
+      const cut = v.indexOf(":");
+      const on = cut < 0 ? v : v.slice(0, cut);
+      const id = cut < 0 ? "" : v.slice(cut + 1);
+      if (on === "touch") {
+        rule.when = { on, el: def.elements[0]?.id, other: def.elements[1]?.id || def.elements[0]?.id };
+        paintRules();
+        return;
+      }
       if (on === "press") rule.when = { on, el: id };
       else if (on === "timer") rule.when = { on, timer: id };
       else if (on === "count") rule.when = { on, el: id, cmp: ">=", n: 10 };
@@ -777,6 +864,16 @@ const Crumbs = (() => {
       paintRules();
     });
     whenRow.append(whenLabel, trig);
+    if (rule.when.on === "touch") {
+      const things = () => [...def.elements.map((e) => [e.id, elName(e.id)]), ...groupOpts()];
+      const and = document.createElement("span");
+      and.textContent = "and";
+      whenRow.append(
+        selectEl(things(), rule.when.el, (v) => (rule.when.el = v)),
+        and,
+        selectEl(things(), rule.when.other, (v) => (rule.when.other = v))
+      );
+    }
     if (rule.when.on === "count") {
       whenRow.append(
         selectEl(
@@ -839,7 +936,9 @@ const Crumbs = (() => {
     return card;
   }
 
-  const withPressed = () => [["@pressed", "the pressed one"], ...def.elements.map((e) => [e.id, elName(e.id)])];
+  const withPressed = () => [["@pressed", "the pressed one"], ...def.elements.map((e) => [e.id, elName(e.id)]), ...groupOpts()];
+  const gridOpts = () => def.elements.filter((e) => e.type === "grid").map((e) => [e.id, elName(e.id)]);
+  const counterOpts = () => def.elements.filter((e) => e.type === "counter").map((e) => [e.id, elName(e.id)]);
 
   const COND_KINDS = [
     ["text:==", "text is"],
@@ -850,6 +949,21 @@ const Crumbs = (() => {
     ["num:!=", "counter ≠"],
     ["shown:==", "is shown"],
     ["shown:!=", "is hidden"],
+    ["enabled:==", "is turned on"],
+    ["enabled:!=", "is turned off"],
+    ["touch:==", "is touching"],
+    ["touch:!=", "isn't touching"],
+    ["cell:==", "grid: pressed cell is"],
+    ["cell:!=", "grid: pressed cell isn't"],
+    ["room:==", "grid: pressed column has room"],
+    ["line:==", "grid: has a line of"],
+    ["line:!=", "grid: has no line of"],
+    ["full:==", "grid: is full"],
+    ["full:!=", "grid: isn't full"],
+    ["all:==", "group: all shown"],
+    ["any:==", "group: any shown"],
+    ["none:==", "group: none shown"],
+    ["math:==", "math is true"],
   ];
 
   function condRow(rule, cond, index) {
@@ -857,21 +971,47 @@ const Crumbs = (() => {
     row.className = "cb-rule-row cb-cond";
     const label = document.createElement("span");
     label.textContent = index === 0 ? "only if" : "and";
+    const k = cond.k;
+    const isGrid = ["cell", "room", "line", "full"].includes(k);
+    const isGroup = ["all", "any", "none"].includes(k);
+    row.append(label);
+    if (k !== "math") {
+      const opts = isGrid ? gridOpts() : isGroup ? groupOpts() : withPressed();
+      if (opts.length && !opts.some(([v]) => v === cond.el)) cond.el = opts[0][0];
+      row.append(selectEl(opts.length ? opts : [["", isGroup ? "(no groups yet)" : "(add a grid)"]], cond.el, (v) => (cond.el = v)));
+    }
     row.append(
-      label,
-      selectEl(withPressed(), cond.el, (v) => (cond.el = v)),
-      selectEl(COND_KINDS, `${cond.k}:${cond.op}`, (v) => {
-        const [k, op] = v.split(":");
-        cond.k = k;
-        cond.op = op;
-        cond.v = k === "num" ? 0 : k === "text" ? "" : undefined;
+      selectEl(COND_KINDS, `${k}:${cond.op || "=="}`, (v) => {
+        const [nk, op] = v.split(":");
+        const fresh = { k: nk, op, el: cond.el };
+        if (nk === "num") fresh.v = 0;
+        if (nk === "text" || nk === "cell") fresh.v = "";
+        if (nk === "line") {
+          fresh.v = "";
+          fresh.n = 3;
+        }
+        if (nk === "touch") fresh.other = def.elements.find((e) => e.id !== cond.el)?.id || cond.el;
+        if (nk === "math") fresh.expr = "";
+        Object.keys(cond).forEach((key) => delete cond[key]);
+        Object.assign(cond, fresh);
         paintRules();
       })
     );
-    if (cond.k === "text") {
+    if (k === "text") {
       row.append(inputEl("text", cond.v, (v) => (cond.v = v), { maxLength: 200, placeholder: "(empty)" }));
-    } else if (cond.k === "num") {
+    } else if (k === "num") {
       row.append(inputEl("number", cond.v, (v) => (cond.v = v), { className: "cb-num" }));
+    } else if (k === "cell") {
+      row.append(inputEl("text", cond.v, (v) => (cond.v = v), { maxLength: 20, placeholder: "(empty)", className: "cb-short" }));
+    } else if (k === "line") {
+      row.append(
+        inputEl("number", cond.n, (v) => (cond.n = v), { className: "cb-num", min: 2, max: 12, title: "how many in a row" }),
+        inputEl("text", cond.v, (v) => (cond.v = v), { maxLength: 20, placeholder: "anything", className: "cb-short", title: "which piece (leave empty = anyone's)" })
+      );
+    } else if (k === "touch") {
+      row.append(selectEl([...def.elements.map((e) => [e.id, elName(e.id)]), ...groupOpts()], cond.other, (v) => (cond.other = v)));
+    } else if (k === "math") {
+      row.append(inputEl("text", cond.expr, (v) => (cond.expr = v), { maxLength: 200, placeholder: "score >= 10 && lives > 0" }));
     }
     const x = document.createElement("button");
     x.type = "button";
@@ -964,6 +1104,14 @@ const Crumbs = (() => {
     ["set", "set counter"],
     ["addc", "add counter onto counter"],
     ["move", "move"],
+    ["moveby", "nudge (move by)"],
+    ["cell", "grid: set a cell"],
+    ["drop", "grid: drop into pressed column"],
+    ["clear", "grid: clear"],
+    ["cycle", "cycle text through"],
+    ["calc", "set counter to math"],
+    ["disable", "turn off (can't press)"],
+    ["enable", "turn back on"],
     ["start", "start timer"],
     ["stop", "stop timer"],
     ["screen", "screen effect"],
@@ -1000,6 +1148,20 @@ const Crumbs = (() => {
         fresh.from = counters[0]?.id || first;
         fresh.el = counters[1]?.id || counters[0]?.id || first;
       }
+      const grid0 = def.elements.find((e) => e.type === "grid")?.id;
+      if (["moveby", "disable", "enable", "cycle"].includes(v)) fresh.el = action.el || first;
+      if (v === "moveby") {
+        fresh.dx = 10;
+        fresh.dy = 0;
+      }
+      if (v === "cycle") fresh.opts = ["X", "O"];
+      if (v === "calc") {
+        fresh.el = counter;
+        fresh.expr = "";
+      }
+      if (v === "cell" || v === "drop" || v === "clear") fresh.el = grid0;
+      if (v === "cell") fresh.at = "pressed";
+      if (v === "cell" || v === "drop") fresh.text = "X";
       if (v === "move") {
         fresh.x = 50;
         fresh.y = 50;
@@ -1023,7 +1185,7 @@ const Crumbs = (() => {
     });
     row.append(arrow, kind);
     const elOptions = def.elements.map((e) => [e.id, elName(e.id)]);
-    if (["show", "hide", "toggle", "text", "color", "move", "image"].includes(action.a)) {
+    if (["show", "hide", "toggle", "text", "color", "move", "image", "moveby", "disable", "enable", "cycle"].includes(action.a)) {
       const opts =
         action.a === "image"
           ? [["@pressed", "the pressed one"], ...elOptions.filter(([id]) => def.elements.find((e) => e.id === id)?.type === "image")]
@@ -1037,7 +1199,7 @@ const Crumbs = (() => {
     }
     if (action.a === "wait") {
       row.append(
-        selectEl([["*", "anything"], ...elOptions], action.el, (v) => (action.el = v)),
+        selectEl([["*", "anything"], ...elOptions, ...groupOpts()], action.el, (v) => (action.el = v)),
         field("only empty ones", inputEl("checkbox", action.blank, (v) => (action.blank = v)))
       );
     }
@@ -1072,7 +1234,89 @@ const Crumbs = (() => {
         inputEl("number", action.n, (v) => (action.n = v), { className: "cb-num" })
       );
     }
-    if (action.a === "text") row.append(inputEl("text", action.text, (v) => (action.text = v), { maxLength: 200 }));
+    if (action.a === "text") {
+      const t = inputEl("text", action.text, (v) => (action.text = v), { maxLength: 200 });
+      t.title = "Tip: {score} shows a counter, {line} shows who got the line";
+      row.append(t);
+    }
+    if (action.a === "moveby") {
+      const right = document.createElement("span");
+      right.textContent = "right";
+      const down = document.createElement("span");
+      down.textContent = "down";
+      row.append(
+        right,
+        inputEl("number", action.dx, (v) => (action.dx = v), { className: "cb-num", title: "% of the card (negative = left)" }),
+        down,
+        inputEl("number", action.dy, (v) => (action.dy = v), { className: "cb-num", title: "% of the card (negative = up)" })
+      );
+    }
+    if (action.a === "cycle") {
+      row.append(
+        inputEl("text", (action.opts || []).join(", "), (v) => (action.opts = v.split(",").map((o) => o.trim()).filter(Boolean)), {
+          maxLength: 200,
+          placeholder: "X, O",
+          title: "Each time, the text moves to the next one in this list",
+        })
+      );
+    }
+    if (action.a === "calc") {
+      const to = document.createElement("span");
+      to.textContent = "to";
+      row.append(
+        selectEl(counterOpts(), action.el, (v) => (action.el = v)),
+        to,
+        inputEl("text", action.expr, (v) => (action.expr = v), { maxLength: 200, placeholder: "score + hits * 10" })
+      );
+    }
+    if (["cell", "drop", "clear"].includes(action.a)) {
+      const grids = gridOpts();
+      row.append(selectEl(grids.length ? grids : [["", "(add a grid first)"]], action.el, (v) => (action.el = v)));
+    }
+    if (action.a === "cell") {
+      row.append(
+        selectEl(
+          [
+            ["pressed", "the pressed cell"],
+            ["rc", "row / column"],
+          ],
+          action.at,
+          (v) => {
+            action.at = v;
+            if (v === "rc") {
+              action.r = action.r || 1;
+              action.c = action.c || 1;
+            }
+            paintRules();
+          }
+        )
+      );
+      if (action.at === "rc") {
+        row.append(
+          inputEl("number", action.r, (v) => (action.r = v), { className: "cb-num", min: 1, max: 12, title: "row" }),
+          inputEl("number", action.c, (v) => (action.c = v), { className: "cb-num", min: 1, max: 12, title: "column" })
+        );
+      }
+    }
+    if (action.a === "cell" || action.a === "drop") {
+      const to = document.createElement("span");
+      to.textContent = "to";
+      const sourceOpts = [["", "this:"], ...def.elements.filter((e) => e.type !== "grid").map((e) => [e.id, `text of ${elName(e.id)}`])];
+      row.append(
+        to,
+        selectEl(sourceOpts, action.from || "", (v) => {
+          if (v) {
+            action.from = v;
+            delete action.text;
+          } else {
+            delete action.from;
+            action.text = "X";
+          }
+          paintRules();
+        })
+      );
+      if (!action.from) row.append(inputEl("text", action.text, (v) => (action.text = v), { maxLength: 20, className: "cb-short", placeholder: "X" }));
+    }
     if (action.a === "color") row.append(inputEl("color", action.color, (v) => (action.color = v)));
     if (action.a === "move") row.append(movePicker(rule, action));
     if (action.a === "image" || action.a === "sound") {
@@ -1146,8 +1390,8 @@ const Crumbs = (() => {
       draw(card, clean, testState, {
         assetUrl: localUrl,
         now: () => Date.now(),
-        onPress: (el) => {
-          const result = E.apply(clean, testState, { type: "press", el });
+        onPress: (el, node, cell) => {
+          const result = E.apply(clean, testState, cell === undefined ? { type: "press", el } : { type: "press", el, cell });
           testState = result.state;
           playFired(result.fired, localUrl);
           paint();
